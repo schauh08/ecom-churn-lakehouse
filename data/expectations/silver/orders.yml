@@ -1,0 +1,19 @@
+dataset: orders
+layer: silver
+version: v1
+checks:
+  - name: not_null_keys
+    type: not_null
+    columns: [order_id, customer_id, order_purchase_ts]
+    severity: critical
+
+  - name: unique_order_id
+    type: unique
+    columns: [order_id]
+    severity: critical
+
+  - name: allowed_status
+    type: in_set
+    column: order_status
+    allowed: [delivered, shipped, canceled, invoiced, processing]
+    severity: critical
