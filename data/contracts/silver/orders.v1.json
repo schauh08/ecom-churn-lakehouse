@@ -1,0 +1,15 @@
+{
+  "dataset": "orders",
+  "layer": "silver",
+  "version": "v1",
+  "primary_key": ["order_id"],
+  "columns": {
+    "order_id": "string",
+    "customer_id": "string",
+    "order_purchase_ts": "timestamp",
+    "order_status": "string"
+  },
+  "allowed_values": {
+    "order_status": ["delivered", "shipped", "canceled", "invoiced", "processing"]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "dataset": "customer_features_daily",
+  "layer": "gold",
+  "version": "v1",
+  "primary_key": ["customer_id", "as_of_date"],
+  "columns": {
+    "customer_id": "string",
+    "as_of_date": "date",
+    "recency_days": "int",
+    "orders_30d": "int"
+  }
+}
