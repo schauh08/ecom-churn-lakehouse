@@ -1,5 +1,10 @@
 RUN_ID := $(shell python -c "import uuid; print(uuid.uuid4())")
 
+LAKEHOUSE_ROOT ?= lakehouse
+ARTIFACTS_ROOT ?= artifacts
+INPUT_ORDERS ?= data/sample/orders.parquet
+AS_OF_DATE ?= 2026-01-31
+
 slice:
 	mkdir -p lakehouse/bronze/orders lakehouse/silver/orders lakehouse/gold/customer_features_daily artifacts
 
