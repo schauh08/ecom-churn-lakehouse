@@ -1,13 +1,14 @@
 from __future__ import annotations
+from pathlib import Path
+from typing import Dict, Sequence, Tuple
+from fastapi.testclient import TestClient
+from services.api.app.main import app
 
 import json
 import os
 import shutil
 import subprocess
 import uuid
-from pathlib import Path
-from typing import Dict, Sequence, Tuple
-
 import pytest
 
 
@@ -193,3 +194,12 @@ def test_slice_e2e(tmp_path: Path) -> None:
         assert fv_gold == meta["feature_version"], (
             f"feature_version mismatch: gold={fv_gold} vs meta={meta['feature_version']}"
         )
+
+client = TestClient(app)
+
+r = client.post("/v1/churn/predict", json={"customer_id": "CUST_0001"})
+assert r.status_code == 200, r.text
+body = r.json()
+
+assert body.get("model_version")
+assert body.get("feature_version")
