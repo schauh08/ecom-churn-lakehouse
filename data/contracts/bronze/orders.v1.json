@@ -15,7 +15,9 @@
     "order_estimated_delivery_date",
     "run_id",
     "ingest_ts",
+    "ingest_date",
     "source_file",
+    "source_fingerprint",
     "row_count",
     "schema_hash"
   ],
@@ -32,15 +34,19 @@
 
     "run_id": { "type": "string", "nullable": false },
     "ingest_ts": { "type": "timestamp", "nullable": false },
+    "ingest_date": { "type": "date", "nullable": false },
     "source_file": { "type": "string", "nullable": false },
+    "source_fingerprint": { "type": "string", "nullable": false },
     "row_count": { "type": "long", "nullable": false },
     "schema_hash": { "type": "string", "nullable": false }
   },
 
   "schema_hash_rule": {
     "algorithm": "sha256",
-    "applies_to": "source_columns_only",
+    "digest_length_hex": 16,
+    "applies_to": "required_source_columns_only",
     "column_order": "fixed",
+    "representation": "column_name:type joined by |",
     "columns": [
       "order_id",
       "customer_id",
@@ -51,7 +57,6 @@
       "order_delivered_customer_date",
       "order_estimated_delivery_date"
     ],
-    "representation": "lowercase(column_name) + ':' + logical_type joined by '|' in listed order",
     "stored_in_column": "schema_hash"
   }
 }
