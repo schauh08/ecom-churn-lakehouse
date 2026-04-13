@@ -1,15 +1,49 @@
 {
-  "dataset": "orders",
-  "layer": "silver",
-  "version": "v1",
+  "contract_name": "silver.orders",
+  "contract_version": 1,
+  "description": "Trusted Silver orders table for V2.",
+  "allow_extra_columns": false,
   "primary_key": ["order_id"],
+  "required_columns": [
+    "order_id",
+    "customer_id",
+    "order_purchase_ts",
+    "order_status",
+    "_bronze_run_id",
+    "_bronze_ingest_ts",
+    "_bronze_source_file",
+    "_bronze_source_fingerprint",
+    "_bronze_schema_hash",
+    "_schema_version",
+    "_silver_run_id",
+    "_silver_ts"
+  ],
   "columns": {
-    "order_id": "string",
-    "customer_id": "string",
-    "order_purchase_ts": "timestamp",
-    "order_status": "string"
+    "order_id": { "type": "string", "nullable": false },
+    "customer_id": { "type": "string", "nullable": false },
+    "order_purchase_ts": { "type": "timestamp", "nullable": false },
+    "order_status": { "type": "string", "nullable": false },
+
+    "_bronze_run_id": { "type": "string", "nullable": false },
+    "_bronze_ingest_ts": { "type": "timestamp", "nullable": false },
+    "_bronze_source_file": { "type": "string", "nullable": false },
+    "_bronze_source_fingerprint": { "type": "string", "nullable": false },
+    "_bronze_schema_hash": { "type": "string", "nullable": false },
+
+    "_schema_version": { "type": "string", "nullable": false },
+    "_silver_run_id": { "type": "string", "nullable": false },
+    "_silver_ts": { "type": "timestamp", "nullable": false }
   },
   "allowed_values": {
-    "order_status": ["delivered", "shipped", "canceled", "invoiced", "processing"]
+    "order_status": [
+      "approved",
+      "canceled",
+      "created",
+      "delivered",
+      "invoiced",
+      "processing",
+      "shipped",
+      "unavailable"
+    ]
   }
 }
