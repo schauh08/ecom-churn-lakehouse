@@ -1,12 +1,57 @@
 {
-  "dataset": "orders",
-  "layer": "bronze",
-  "version": "v1",
-  "primary_key": ["order_id"],
+  "contract_name": "bronze.orders",
+  "contract_version": 1,
+  "description": "Bronze landed orders table for V2 using Olist orders source.",
+  "allow_extra_columns": false,
+
+  "required_columns": [
+    "order_id",
+    "customer_id",
+    "order_status",
+    "order_purchase_timestamp",
+    "order_approved_at",
+    "order_delivered_carrier_date",
+    "order_delivered_customer_date",
+    "order_estimated_delivery_date",
+    "run_id",
+    "ingest_ts",
+    "source_file",
+    "row_count",
+    "schema_hash"
+  ],
+
   "columns": {
-    "order_id": "string",
-    "customer_id": "string",
-    "order_purchase_ts": "timestamp",
-    "order_status": "string"
+    "order_id": { "type": "string", "nullable": true },
+    "customer_id": { "type": "string", "nullable": true },
+    "order_status": { "type": "string", "nullable": true },
+    "order_purchase_timestamp": { "type": "string", "nullable": true },
+    "order_approved_at": { "type": "string", "nullable": true },
+    "order_delivered_carrier_date": { "type": "string", "nullable": true },
+    "order_delivered_customer_date": { "type": "string", "nullable": true },
+    "order_estimated_delivery_date": { "type": "string", "nullable": true },
+
+    "run_id": { "type": "string", "nullable": false },
+    "ingest_ts": { "type": "timestamp", "nullable": false },
+    "source_file": { "type": "string", "nullable": false },
+    "row_count": { "type": "long", "nullable": false },
+    "schema_hash": { "type": "string", "nullable": false }
+  },
+
+  "schema_hash_rule": {
+    "algorithm": "sha256",
+    "applies_to": "source_columns_only",
+    "column_order": "fixed",
+    "columns": [
+      "order_id",
+      "customer_id",
+      "order_status",
+      "order_purchase_timestamp",
+      "order_approved_at",
+      "order_delivered_carrier_date",
+      "order_delivered_customer_date",
+      "order_estimated_delivery_date"
+    ],
+    "representation": "lowercase(column_name) + ':' + logical_type joined by '|' in listed order",
+    "stored_in_column": "schema_hash"
   }
 }
