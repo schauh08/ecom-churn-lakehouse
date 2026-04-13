@@ -12,17 +12,59 @@ from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 from src.common.spark import get_spark
 
 
+BRONZE_SOURCE_SCHEMA: list[tuple[str, str]] = [
+    ("order_id", "string"),
+    ("customer_id", "string"),
+    ("order_status", "string"),
+    ("order_purchase_timestamp", "string"),
+    ("order_approved_at", "string"),
+    ("order_delivered_carrier_date", "string"),
+    ("order_delivered_customer_date", "string"),
+    ("order_estimated_delivery_date", "string"),
+]
+
+
 def _canonical_json(obj: object) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+def _spark_type_name(dtype: T.DataType) -> str:
+    simple = dtype.simpleString()
+    mapping = {
+        "string": "string",
+        "timestamp": "timestamp",
+        "date": "date",
+        "bigint": "long",
+        "long": "long",
+        "int": "int",
+        "double": "double",
+        "float": "float",
+        "boolean": "boolean",
+    }
+    return mapping.get(simple, simple)
 
 
-def _hash_schema(df: DataFrame) -> str:
-    schema_obj = df.schema.jsonValue()
-    return hashlib.sha256(_canonical_json(schema_obj)).hexdigest()[:16]
+def _validate_raw_schema(df: DataFrame) -> None:
+    actual = {field.name: _spark_type_name(field.dataType) for field in df.schema.fields}
+
+    expected_cols = [name for name, _ in BRONZE_SOURCE_SCHEMA]
+    missing = [name for name in expected_cols if name not in actual]
+    if missing:
+        raise ValueError(f"Missing required Bronze source columns: {missing}")
+
+    mismatches: list[str] = []
+    for name, expected_type in BRONZE_SOURCE_SCHEMA:
+        actual_type = actual[name]
+        if actual_type != expected_type:
+            mismatches.append(f"{name}: expected {expected_type}, got {actual_type}")
+
+    if mismatches:
+        raise ValueError("Bronze schema contract type mismatch: " + "; ".join(mismatches))
+
+
+def _hash_contract_schema() -> str:
+    material = "|".join(f"{name}:{dtype}" for name, dtype in BRONZE_SOURCE_SCHEMA)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def _to_local_path(path_str: str) -> Path | None:
@@ -170,10 +212,10 @@ def main() -> None:
     if not input_files:
         raise ValueError(f"No input files found under: {args.input}")
 
-    # 2) Compute batch-level lineage metadata.
+    # 2) Compute lineage + validate raw schema against the Bronze contract.
     source_fingerprint = _build_source_fingerprint(input_files)
-    schema_hash = _hash_schema(raw_df)
-    row_count = raw_df.count()
+    _validate_raw_schema(raw_df)
+    schema_hash = _hash_contract_schema()
 
     # 3) Idempotency: do not ingest the exact same batch twice.
     if _already_ingested(
@@ -191,7 +233,7 @@ def main() -> None:
             source_fingerprint=source_fingerprint,
             source_path=args.input,
             source_file_count=len(input_files),
-            row_count=row_count,
+            row_count=0,
             schema_hash=schema_hash,
             ingest_ts=ingest_ts,
             bronze_path=args.bronze_path,
@@ -199,22 +241,24 @@ def main() -> None:
         )
         return
 
+    row_count = raw_df.count()
+
     # 4) Stamp row-level Bronze metadata.
     out_df = (
-        raw_df.withColumn("_ingest_run_id", F.lit(args.run_id))
-        .withColumn("_ingest_ts", F.lit(ingest_ts).cast("timestamp"))
-        .withColumn("_ingest_date", F.to_date(F.col("_ingest_ts")))
-        .withColumn("_source_file", F.input_file_name())
-        .withColumn("_source_fingerprint", F.lit(source_fingerprint))
-        .withColumn("_row_count", F.lit(row_count))
-        .withColumn("_schema_hash", F.lit(schema_hash))
+        raw_df.withColumn("run_id", F.lit(args.run_id))
+        .withColumn("ingest_ts", F.lit(ingest_ts).cast("timestamp"))
+        .withColumn("ingest_date", F.to_date(F.col("ingest_ts")))
+        .withColumn("source_file", F.input_file_name())
+        .withColumn("source_fingerprint", F.lit(source_fingerprint))
+        .withColumn("row_count", F.lit(row_count).cast("long"))
+        .withColumn("schema_hash", F.lit(schema_hash))
     )
 
     # 5) Append-only Bronze write, partitioned by ingest date.
     (
         out_df.write.format("delta")
         .mode("append")
-        .partitionBy("_ingest_date")
+        .partitionBy("ingest_date")
         .save(args.bronze_path)
     )
 
