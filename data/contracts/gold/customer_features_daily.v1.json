@@ -1,12 +1,76 @@
 {
-  "dataset": "customer_features_daily",
-  "layer": "gold",
-  "version": "v1",
+  "contract_name": "gold.customer_features_daily",
+  "contract_version": 1,
+  "description": "Point-in-time correct daily customer feature snapshot for churn modeling in V2.",
+  "allow_extra_columns": false,
+  "grain": ["customer_id", "as_of_date"],
   "primary_key": ["customer_id", "as_of_date"],
+
+  "required_columns": [
+    "customer_id",
+    "as_of_date",
+    "recency_days",
+    "orders_30d",
+    "orders_90d",
+    "lifetime_orders",
+    "customer_tenure_days",
+    "avg_days_between_orders",
+    "_snapshot_id",
+    "_feature_version",
+    "_gold_run_id",
+    "_gold_ts"
+  ],
+
   "columns": {
-    "customer_id": "string",
-    "as_of_date": "date",
-    "recency_days": "int",
-    "orders_30d": "int"
+    "customer_id": { "type": "string", "nullable": false },
+    "as_of_date": { "type": "date", "nullable": false },
+
+    "recency_days": { "type": "int", "nullable": false, "min_value": 0 },
+    "orders_30d": { "type": "long", "nullable": false, "min_value": 0 },
+    "orders_90d": { "type": "long", "nullable": false, "min_value": 0 },
+    "lifetime_orders": { "type": "long", "nullable": false, "min_value": 1 },
+    "customer_tenure_days": { "type": "int", "nullable": false, "min_value": 0 },
+    "avg_days_between_orders": { "type": "double", "nullable": false, "min_value": 0.0 },
+
+    "_snapshot_id": { "type": "string", "nullable": false },
+    "_feature_version": { "type": "string", "nullable": false },
+    "_gold_run_id": { "type": "string", "nullable": false },
+    "_gold_ts": { "type": "timestamp", "nullable": false }
+  },
+
+  "quality_rules": {
+    "required_not_null": [
+      "customer_id",
+      "as_of_date",
+      "recency_days",
+      "orders_30d",
+      "orders_90d",
+      "lifetime_orders",
+      "customer_tenure_days",
+      "avg_days_between_orders",
+      "_snapshot_id",
+      "_feature_version",
+      "_gold_run_id",
+      "_gold_ts"
+    ],
+    "range_rules": [
+      "recency_days >= 0",
+      "orders_30d >= 0",
+      "orders_90d >= 0",
+      "lifetime_orders >= 1",
+      "customer_tenure_days >= 0",
+      "avg_days_between_orders >= 0.0"
+    ],
+    "ordering_rules": [
+      "orders_30d <= orders_90d",
+      "orders_90d <= lifetime_orders",
+      "recency_days <= customer_tenure_days"
+    ]
+  },
+
+  "snapshot_id_rule": {
+    "algorithm": "sha256",
+    "digest_length_hex": 16,
+    "input": "as_of_date|feature_version"
   }
 }
