@@ -5,17 +5,20 @@ import hashlib
 import json
 import math
 import pickle
+import subprocess
 from pathlib import Path
 from typing import Any
 
+import mlflow
+import mlflow.sklearn
 from pyspark.sql import functions as F
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from src.common.spark import get_spark
 from src.common.versioning import hash_contract_json
+from src.common.spark import get_spark
 
 
 FEATURE_COLUMNS = [
@@ -64,20 +67,53 @@ def _write_pickle(path: str, obj: Any) -> None:
         pickle.dump(obj, f)
 
 
+def _git_sha() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        value = proc.stdout.strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def _schema_hash_from_columns(df) -> str:
+    schema_obj = json.loads(df.schema.json())
+    return _hash_obj(schema_obj)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--training_snapshot_path", required=True)
     parser.add_argument("--feature_contract", required=True)
+
     parser.add_argument("--out_model_path", required=True)
     parser.add_argument("--out_model_meta", required=True)
     parser.add_argument("--evaluation_summary_path", required=True)
+    parser.add_argument("--approved_model_version_path", required=True)
+    parser.add_argument("--feature_schema_info_path", required=True)
+
     parser.add_argument("--model_name", default="ecomm-churn")
     parser.add_argument("--validation_fraction", type=float, default=0.20)
     parser.add_argument("--random_state", type=int, default=42)
+
+    parser.add_argument("--mlflow_tracking_uri", default=None)
+    parser.add_argument("--mlflow_experiment", default="ecomm-churn-slice")
+
     args = parser.parse_args()
 
     if not (0.0 < args.validation_fraction < 1.0):
         raise ValueError("--validation_fraction must be between 0 and 1.")
+
+    if args.mlflow_tracking_uri:
+        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+
+    mlflow.set_experiment(args.mlflow_experiment)
 
     spark = get_spark("train_baseline_logreg")
 
@@ -103,12 +139,24 @@ def main() -> None:
     snapshot_feature_version = _single_distinct_value(snapshot, "_feature_version")
     data_snapshot_id = _single_distinct_value(snapshot, "_data_snapshot_id")
     label_version = _single_distinct_value(snapshot, "_label_version")
+    payload_schema_hash = _schema_hash_from_columns(snapshot)
+    git_sha = _git_sha()
 
     if contract_feature_version != snapshot_feature_version:
         raise RuntimeError(
             "Feature contract hash does not match training snapshot feature version. "
             f"contract={contract_feature_version}, snapshot={snapshot_feature_version}"
         )
+
+    feature_schema_info = {
+        "feature_columns": FEATURE_COLUMNS,
+        "feature_version": snapshot_feature_version,
+        "feature_contract_hash": contract_feature_version,
+        "training_snapshot_schema_hash": payload_schema_hash,
+        "label_version": label_version,
+        "data_snapshot_id": data_snapshot_id,
+    }
+    _write_json(args.feature_schema_info_path, feature_schema_info)
 
     pdf = snapshot.toPandas()
     if pdf.empty:
@@ -166,73 +214,98 @@ def main() -> None:
         ]
     )
 
-    model.fit(X_train, y_train)
+    with mlflow.start_run(run_name=f"{args.model_name}-{data_snapshot_id}") as run:
+        model.fit(X_train, y_train)
 
-    valid_proba = model.predict_proba(X_valid)[:, 1]
-    pr_auc = float(average_precision_score(y_valid, valid_proba))
-    roc_auc = float(roc_auc_score(y_valid, valid_proba))
-    brier = float(brier_score_loss(y_valid, valid_proba))
+        valid_proba = model.predict_proba(X_valid)[:, 1]
+        pr_auc = float(average_precision_score(y_valid, valid_proba))
+        roc_auc = float(roc_auc_score(y_valid, valid_proba))
+        brier = float(brier_score_loss(y_valid, valid_proba))
 
-    model_version = _hash_obj(
-        {
+        model_version = _hash_obj(
+            {
+                "model_name": args.model_name,
+                "algorithm": "logistic_regression",
+                "data_snapshot_id": data_snapshot_id,
+                "feature_version": snapshot_feature_version,
+                "label_version": label_version,
+                "validation_fraction": args.validation_fraction,
+                "random_state": args.random_state,
+                "version": 2,
+            }
+        )
+
+        approved_payload = {
+            "approved_model_version": model_version,
             "model_name": args.model_name,
-            "algorithm": "logistic_regression",
             "data_snapshot_id": data_snapshot_id,
             "feature_version": snapshot_feature_version,
             "label_version": label_version,
+            "mlflow_run_id": run.info.run_id,
+        }
+        _write_json(args.approved_model_version_path, approved_payload)
+
+        model_bundle = {
+            "model_name": args.model_name,
+            "model_version": model_version,
+            "algorithm": "logistic_regression",
+            "feature_columns": FEATURE_COLUMNS,
+            "feature_version": snapshot_feature_version,
+            "label_version": label_version,
+            "data_snapshot_id": data_snapshot_id,
+            "training_snapshot_schema_hash": payload_schema_hash,
+            "mlflow_run_id": run.info.run_id,
+            "pipeline": model,
+        }
+        _write_pickle(args.out_model_path, model_bundle)
+
+        meta = {
+            "model_name": args.model_name,
+            "model_version": model_version,
+            "approved_model_version": model_version,
+            "algorithm": "logistic_regression",
+            "feature_columns": FEATURE_COLUMNS,
+            "feature_version": snapshot_feature_version,
+            "feature_contract_hash": contract_feature_version,
+            "label_version": label_version,
+            "data_snapshot_id": data_snapshot_id,
+            "training_snapshot_path": args.training_snapshot_path,
+            "training_snapshot_schema_hash": payload_schema_hash,
             "validation_fraction": args.validation_fraction,
             "random_state": args.random_state,
-            "version": 1,
+            "train_row_count": int(len(train_df)),
+            "validation_row_count": int(len(valid_df)),
+            "train_as_of_date_min": str(min(train_dates)),
+            "train_as_of_date_max": str(max(train_dates)),
+            "validation_as_of_date_min": str(min(valid_dates)),
+            "validation_as_of_date_max": str(max(valid_dates)),
+            "train_positive_rate": float(y_train.mean()),
+            "validation_positive_rate": float(y_valid.mean()),
+            "code_version": git_sha,
+            "mlflow_tracking_uri": mlflow.get_tracking_uri(),
+            "mlflow_experiment": args.mlflow_experiment,
+            "mlflow_run_id": run.info.run_id,
+            "metrics": {
+                "pr_auc": pr_auc,
+                "roc_auc": roc_auc,
+                "brier_score": brier,
+            },
         }
-    )
+        _write_json(args.out_model_meta, meta)
 
-    model_bundle = {
-        "model_name": args.model_name,
-        "model_version": model_version,
-        "algorithm": "logistic_regression",
-        "feature_columns": FEATURE_COLUMNS,
-        "feature_version": snapshot_feature_version,
-        "label_version": label_version,
-        "data_snapshot_id": data_snapshot_id,
-        "pipeline": model,
-    }
-    _write_pickle(args.out_model_path, model_bundle)
-
-    meta = {
-        "model_name": args.model_name,
-        "model_version": model_version,
-        "algorithm": "logistic_regression",
-        "feature_columns": FEATURE_COLUMNS,
-        "feature_version": snapshot_feature_version,
-        "label_version": label_version,
-        "data_snapshot_id": data_snapshot_id,
-        "training_snapshot_path": args.training_snapshot_path,
-        "validation_fraction": args.validation_fraction,
-        "random_state": args.random_state,
-        "train_row_count": int(len(train_df)),
-        "validation_row_count": int(len(valid_df)),
-        "train_as_of_date_min": str(min(train_dates)),
-        "train_as_of_date_max": str(max(train_dates)),
-        "validation_as_of_date_min": str(min(valid_dates)),
-        "validation_as_of_date_max": str(max(valid_dates)),
-        "train_positive_rate": float(y_train.mean()),
-        "validation_positive_rate": float(y_valid.mean()),
-        "metrics": {
-            "pr_auc": pr_auc,
-            "roc_auc": roc_auc,
-            "brier_score": brier,
-        },
-    }
-    _write_json(args.out_model_meta, meta)
-
-    summary = f"""# Baseline Logistic Regression Evaluation
+        summary = f"""# Baseline Logistic Regression Evaluation
 
 Model name: {args.model_name}
 Model version: {model_version}
+Approved model version: {model_version}
 Algorithm: logistic_regression
 Data snapshot id: {data_snapshot_id}
 Feature version: {snapshot_feature_version}
 Label version: {label_version}
+Training snapshot schema hash: {payload_schema_hash}
+Code version (git SHA): {git_sha}
+MLflow experiment: {args.mlflow_experiment}
+MLflow run id: {run.info.run_id}
 
 ## Split
 - Train as_of_date range: {min(train_dates)} to {max(train_dates)}
@@ -255,7 +328,59 @@ Label version: {label_version}
 - customer_tenure_days
 - avg_days_between_orders
 """
-    _write_text(args.evaluation_summary_path, summary)
+        _write_text(args.evaluation_summary_path, summary)
+
+        mlflow.set_tags(
+            {
+                "model_name": args.model_name,
+                "algorithm": "logistic_regression",
+                "model_version": model_version,
+                "approved_model_version": model_version,
+                "data_snapshot_id": data_snapshot_id,
+                "feature_version": snapshot_feature_version,
+                "label_version": label_version,
+                "training_snapshot_schema_hash": payload_schema_hash,
+                "code_version": git_sha or "unknown",
+            }
+        )
+
+        mlflow.log_params(
+            {
+                "model_name": args.model_name,
+                "algorithm": "logistic_regression",
+                "validation_fraction": args.validation_fraction,
+                "random_state": args.random_state,
+                "train_row_count": int(len(train_df)),
+                "validation_row_count": int(len(valid_df)),
+                "feature_version": snapshot_feature_version,
+                "feature_contract_hash": contract_feature_version,
+                "label_version": label_version,
+                "data_snapshot_id": data_snapshot_id,
+                "training_snapshot_schema_hash": payload_schema_hash,
+                "code_version": git_sha or "unknown",
+            }
+        )
+
+        mlflow.log_metrics(
+            {
+                "pr_auc": pr_auc,
+                "roc_auc": roc_auc,
+                "brier_score": brier,
+                "train_positive_rate": float(y_train.mean()),
+                "validation_positive_rate": float(y_valid.mean()),
+            }
+        )
+
+        mlflow.sklearn.log_model(
+            sk_model=model,
+            artifact_path="model",
+        )
+
+        mlflow.log_artifact(args.out_model_path, artifact_path="artifacts")
+        mlflow.log_artifact(args.out_model_meta, artifact_path="artifacts")
+        mlflow.log_artifact(args.evaluation_summary_path, artifact_path="artifacts")
+        mlflow.log_artifact(args.approved_model_version_path, artifact_path="artifacts")
+        mlflow.log_artifact(args.feature_schema_info_path, artifact_path="artifacts")
 
 
 if __name__ == "__main__":
