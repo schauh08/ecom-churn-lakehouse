@@ -8,6 +8,7 @@ from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
 from src.common.spark import get_spark
+from src.common.pipeline_logging import get_pipeline_logger, log_pipeline_event
 
 
 REQUIRED_COLUMNS = [
@@ -86,6 +87,92 @@ def _write_manifest(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gold_path", required=True)
+    parser.add_argument("--latest_features_path", required=True)
+    parser.add_argument("--run_id", required=True)
+    parser.add_argument("--manifest_path", default=None)
+    args = parser.parse_args()
+
+    logger = get_pipeline_logger("pipeline.build_latest_features")
+    log_pipeline_event(
+        logger,
+        "started",
+        run_id=args.run_id,
+        gold_path=args.gold_path,
+        latest_features_path=args.latest_features_path,
+        manifest_path=args.manifest_path,
+    )
+
+    try:
+        spark = get_spark("build_latest_features")
+
+        gold = spark.read.format("delta").load(args.gold_path).select(*REQUIRED_COLUMNS)
+
+        latest_window = Window.partitionBy("customer_id").orderBy(
+            F.col("as_of_date").desc(),
+            F.col("_gold_ts").desc_nulls_last(),
+            F.col("_snapshot_id").desc_nulls_last(),
+        )
+
+        latest = (
+            gold.withColumn("_rn", F.row_number().over(latest_window))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
+        )
+
+        quality_metrics = _assert_quality(latest)
+        row_count = latest.count()
+
+        as_of_date_max_row = latest.agg(F.max("as_of_date").alias("as_of_date_max")).collect()[0]
+        as_of_date_max = (
+            str(as_of_date_max_row["as_of_date_max"])
+            if as_of_date_max_row["as_of_date_max"]
+            else None
+        )
+
+        feature_versions = sorted(
+            [
+                str(row[0])
+                for row in latest.select("_feature_version").distinct().collect()
+                if row[0] is not None
+            ]
+        )
+
+        latest.write.mode("overwrite").parquet(args.latest_features_path)
+
+        _write_manifest(
+            args.manifest_path,
+            latest_features_path=args.latest_features_path,
+            row_count=row_count,
+            as_of_date_max=as_of_date_max,
+            feature_versions=feature_versions,
+            quality_metrics=quality_metrics,
+            run_id=args.run_id,
+        )
+
+        log_pipeline_event(
+            logger,
+            "completed",
+            run_id=args.run_id,
+            latest_features_path=args.latest_features_path,
+            manifest_path=args.manifest_path,
+            row_count=row_count,
+            as_of_date_max=as_of_date_max,
+            feature_versions=feature_versions,
+            quality_metrics=quality_metrics,
+        )
+
+    except Exception as exc:
+        log_pipeline_event(
+            logger,
+            "failed",
+            run_id=args.run_id,
+            gold_path=args.gold_path,
+            latest_features_path=args.latest_features_path,
+            error=str(exc),
+        )
+        raise
     parser = argparse.ArgumentParser()
     parser.add_argument("--gold_path", required=True)
     parser.add_argument("--latest_features_path", required=True)
