@@ -72,8 +72,7 @@ def _assert_gold_quality(features: DataFrame) -> dict[str, int]:
         "invalid_ordering": invalid_ordering,
     }
 
-    failed = any(value > 0 for value in metrics.values())
-    if failed:
+    if any(value > 0 for value in metrics.values()):
         raise RuntimeError(f"Gold feature quality checks failed: {metrics}")
 
     return metrics
@@ -106,29 +105,18 @@ def _write_snapshot_metadata(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--silver_path", required=True)
-    parser.add_argument("--gold_path", required=True)
-    parser.add_argument("--contract", required=True)
-    parser.add_argument("--as_of_date", required=True)  # YYYY-MM-DD
-    parser.add_argument("--run_id", required=True)
-    parser.add_argument(
-        "--snapshot_metadata_path",
-        default=None,
-        help="Optional JSON path for snapshot metadata artifact.",
-    )
-    args = parser.parse_args()
-
-    spark = get_spark("customer_features_daily")
-
-    feature_version = hash_contract_json(args.contract)
-    snapshot_id = _build_snapshot_id(args.as_of_date, feature_version)
-    as_of_date_col = F.to_date(F.lit(args.as_of_date))
+def build_feature_snapshot(
+    silver_orders: DataFrame,
+    *,
+    as_of_date: str,
+    snapshot_id: str,
+    feature_version: str,
+    run_id: str,
+) -> DataFrame:
+    as_of_date_col = F.to_date(F.lit(as_of_date))
 
     orders = (
-        spark.read.format("delta").load(args.silver_path)
-        .select(
+        silver_orders.select(
             "customer_id",
             "order_id",
             "order_purchase_ts",
@@ -136,10 +124,7 @@ def main() -> None:
         .withColumn("order_date", F.to_date("order_purchase_ts"))
     )
 
-    # PIT guard: Gold can only use historical rows through as_of_date, inclusive.
     historical = orders.filter(F.col("order_date") <= as_of_date_col)
-
-    # One row per eligible customer_id, as_of_date.
     customers = historical.select("customer_id").distinct()
 
     order_stats = historical.groupBy("customer_id").agg(
@@ -186,7 +171,7 @@ def main() -> None:
         F.avg("gap_days").cast("double").alias("avg_days_between_orders")
     )
 
-    features = (
+    return (
         customers.join(order_stats, on="customer_id", how="inner")
         .join(orders_30d, on="customer_id", how="left")
         .join(orders_90d, on="customer_id", how="left")
@@ -206,7 +191,7 @@ def main() -> None:
         )
         .withColumn("_snapshot_id", F.lit(snapshot_id))
         .withColumn("_feature_version", F.lit(feature_version))
-        .withColumn("_gold_run_id", F.lit(args.run_id))
+        .withColumn("_gold_run_id", F.lit(run_id))
         .withColumn("_gold_ts", F.current_timestamp())
         .select(
             "customer_id",
@@ -224,6 +209,36 @@ def main() -> None:
         )
     )
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--silver_path", required=True)
+    parser.add_argument("--gold_path", required=True)
+    parser.add_argument("--contract", required=True)
+    parser.add_argument("--as_of_date", required=True)
+    parser.add_argument("--run_id", required=True)
+    parser.add_argument(
+        "--snapshot_metadata_path",
+        default=None,
+        help="Optional JSON path for snapshot metadata artifact.",
+    )
+    args = parser.parse_args()
+
+    spark = get_spark("customer_features_daily")
+
+    feature_version = hash_contract_json(args.contract)
+    snapshot_id = _build_snapshot_id(args.as_of_date, feature_version)
+
+    silver_orders = spark.read.format("delta").load(args.silver_path)
+
+    features = build_feature_snapshot(
+        silver_orders,
+        as_of_date=args.as_of_date,
+        snapshot_id=snapshot_id,
+        feature_version=feature_version,
+        run_id=args.run_id,
+    )
+
     quality_metrics = _assert_gold_quality(features)
     row_count = features.count()
 
@@ -237,7 +252,6 @@ def main() -> None:
         quality_metrics=quality_metrics,
     )
 
-    # Idempotent publish for the same customer_id + as_of_date snapshot key.
     if _delta_exists(spark, args.gold_path):
         target = DeltaTable.forPath(spark, args.gold_path)
         (

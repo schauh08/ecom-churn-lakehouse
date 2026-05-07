@@ -39,6 +39,55 @@ def _write_quarantine(df: DataFrame, path: str) -> None:
     df.write.mode("overwrite").parquet(path)
 
 
+def normalize_and_dedupe_orders(
+    bronze_df: DataFrame,
+    allowed_statuses: list[str],
+) -> tuple[DataFrame, DataFrame, DataFrame]:
+    normalized = bronze_df.select(
+        F.lower(F.trim(F.col("order_id"))).alias("order_id"),
+        F.lower(F.trim(F.col("customer_id"))).alias("customer_id"),
+        F.to_timestamp(
+            F.trim(F.col("order_purchase_timestamp")),
+            "yyyy-MM-dd HH:mm:ss",
+        ).alias("order_purchase_ts"),
+        _normalize_status("order_status").alias("order_status"),
+        F.col("run_id").alias("_bronze_run_id"),
+        F.col("ingest_ts").alias("_bronze_ingest_ts"),
+        F.col("source_file").alias("_bronze_source_file"),
+        F.col("source_fingerprint").alias("_bronze_source_fingerprint"),
+        F.col("schema_hash").alias("_bronze_schema_hash"),
+    )
+
+    preclean_invalid = normalized.filter(
+        F.col("order_id").isNull()
+        | F.col("customer_id").isNull()
+        | F.col("order_purchase_ts").isNull()
+        | F.col("order_status").isNull()
+        | (~F.col("order_status").isin(allowed_statuses))
+    )
+
+    clean = normalized.filter(
+        F.col("order_id").isNotNull()
+        & F.col("customer_id").isNotNull()
+        & F.col("order_purchase_ts").isNotNull()
+        & F.col("order_status").isNotNull()
+        & F.col("order_status").isin(allowed_statuses)
+    )
+
+    dedupe_window = Window.partitionBy("order_id").orderBy(
+        F.col("order_purchase_ts").desc_nulls_last(),
+        F.col("_bronze_ingest_ts").desc_nulls_last(),
+        F.col("_bronze_source_file").desc_nulls_last(),
+        F.col("_bronze_run_id").desc_nulls_last(),
+    )
+    ranked = clean.withColumn("_row_num", F.row_number().over(dedupe_window))
+
+    duplicate_rejects = ranked.filter(F.col("_row_num") > 1).drop("_row_num")
+    deduped = ranked.filter(F.col("_row_num") == 1).drop("_row_num")
+
+    return deduped, preclean_invalid, duplicate_rejects
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bronze_path", required=True)
@@ -68,52 +117,13 @@ def main() -> None:
 
     bronze_df = spark.read.format("delta").load(args.bronze_path)
 
-    normalized = bronze_df.select(
-        F.lower(F.trim(F.col("order_id"))).alias("order_id"),
-        F.lower(F.trim(F.col("customer_id"))).alias("customer_id"),
-        F.to_timestamp(
-            F.trim(F.col("order_purchase_timestamp")),
-            "yyyy-MM-dd HH:mm:ss",
-        ).alias("order_purchase_ts"),
-        _normalize_status("order_status").alias("order_status"),
-        F.col("run_id").alias("_bronze_run_id"),
-        F.col("ingest_ts").alias("_bronze_ingest_ts"),
-        F.col("source_file").alias("_bronze_source_file"),
-        F.col("source_fingerprint").alias("_bronze_source_fingerprint"),
-        F.col("schema_hash").alias("_bronze_schema_hash"),
+    deduped, preclean_invalid, duplicate_rejects = normalize_and_dedupe_orders(
+        bronze_df,
+        allowed_statuses,
     )
 
-    # Quarantine malformed or disallowed rows before publish.
-    preclean_invalid = normalized.filter(
-        F.col("order_id").isNull()
-        | F.col("customer_id").isNull()
-        | F.col("order_purchase_ts").isNull()
-        | F.col("order_status").isNull()
-        | (~F.col("order_status").isin(allowed_statuses))
-    )
     _write_quarantine(preclean_invalid, f"{quarantine_path}/preclean_invalid")
-
-    clean = normalized.filter(
-        F.col("order_id").isNotNull()
-        & F.col("customer_id").isNotNull()
-        & F.col("order_purchase_ts").isNotNull()
-        & F.col("order_status").isNotNull()
-        & F.col("order_status").isin(allowed_statuses)
-    )
-
-    # Deterministic business-key dedupe.
-    dedupe_window = Window.partitionBy("order_id").orderBy(
-        F.col("order_purchase_ts").desc_nulls_last(),
-        F.col("_bronze_ingest_ts").desc_nulls_last(),
-        F.col("_bronze_source_file").desc_nulls_last(),
-        F.col("_bronze_run_id").desc_nulls_last(),
-    )
-    ranked = clean.withColumn("_row_num", F.row_number().over(dedupe_window))
-
-    duplicate_rejects = ranked.filter(F.col("_row_num") > 1).drop("_row_num")
     _write_quarantine(duplicate_rejects, f"{quarantine_path}/duplicate_rejects")
-
-    deduped = ranked.filter(F.col("_row_num") == 1).drop("_row_num")
 
     silver_out = (
         deduped.select(
@@ -141,7 +151,6 @@ def main() -> None:
             f"Silver DQ gate failed. See report at {dq_report_path}. Metrics={dq_result.metrics}"
         )
 
-    # ACID-backed idempotent publish semantics.
     if _delta_exists(spark, args.silver_path):
         target = DeltaTable.forPath(spark, args.silver_path)
         (
