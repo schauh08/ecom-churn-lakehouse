@@ -9,7 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from services.api.app.auth.api_key import require_api_key
 from services.api.app.feature_client.local_latest_features import LocalLatestFeaturesStore
 from services.api.app.inference.model_loader import LocalModelStore
-from services.api.app.observability.logging import hash_identifier, log_event
+from services.api.app.observability.logging import (
+    hash_identifier,
+    increment_counter,
+    log_event,
+)
 from services.api.app.schemas.predict import ErrorResponse, PredictRequest, PredictResponse
 
 
@@ -69,12 +73,14 @@ def predict(
     model_store = get_model_store()
 
     if not feature_store.is_ready():
+        increment_counter("prediction_feature_store_not_ready_total")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Latest feature store is not ready.",
         )
 
     if not model_store.is_ready():
+        increment_counter("prediction_model_store_not_ready_total")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model store is not ready.",
@@ -82,6 +88,7 @@ def predict(
 
     feature_record = feature_store.get(req.customer_id)
     if feature_record is None:
+        increment_counter("prediction_feature_miss_total")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No serving features found for customer_id.",
@@ -89,6 +96,7 @@ def predict(
 
     expected_feature_version = model_store.feature_version()
     if expected_feature_version and feature_record.feature_version != expected_feature_version:
+        increment_counter("prediction_feature_version_mismatch_total")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -99,6 +107,9 @@ def predict(
 
     probability = model_store.predict_probability(feature_record.values)
     churn_label = 1 if probability >= 0.5 else 0
+
+    increment_counter("predictions_total")
+    increment_counter(f"predictions_label_{churn_label}_total")
 
     log_event(
         logger,
