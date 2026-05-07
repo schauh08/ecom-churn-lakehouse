@@ -8,8 +8,10 @@ from fastapi.responses import JSONResponse
 
 from services.api.app.observability.logging import (
     RequestContextMiddleware,
+    increment_counter,
     log_event,
     setup_logging,
+    snapshot_counters,
 )
 from services.api.app.routers.predict import (
     get_feature_store,
@@ -35,6 +37,7 @@ app.include_router(predict_router)
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     request_id = getattr(request.state, "request_id", "unknown")
+    increment_counter("http_validation_errors_total")
     log_event(
         logger,
         logging.WARNING,
@@ -54,6 +57,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     request_id = getattr(request.state, "request_id", "unknown")
+    increment_counter(f"http_exception_{exc.status_code}_total")
     log_event(
         logger,
         logging.WARNING,
@@ -90,6 +94,7 @@ def ready():
         checks={
             "model_store_ready": model_ready,
             "feature_store_ready": features_ready,
+            "observability_ready": True,
         },
         model_version=model_store.model_version() if model_ready else None,
         feature_version=model_store.feature_version() if model_ready else None,
@@ -118,3 +123,8 @@ def version() -> VersionResponse:
         feature_version=model_store.feature_version(),
         approved_model_version=model_store.approved_model_version(),
     )
+
+
+@app.get("/metrics")
+def metrics():
+    return snapshot_counters()
