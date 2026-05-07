@@ -11,6 +11,8 @@ from pyspark.sql.window import Window
 from src.common.dq import run_dq, write_dq_report, write_failed_rows
 from src.common.spark import get_spark
 from src.common.versioning import hash_contract_json
+from src.common.pipeline_logging import get_pipeline_logger, log_pipeline_event
+
 
 
 def _load_contract(path: str) -> dict:
@@ -107,62 +109,116 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    spark = get_spark("orders_bronze_to_silver")
-    contract = _load_contract(args.contract)
-    schema_version = hash_contract_json(args.contract)
-    allowed_statuses = contract["allowed_values"]["order_status"]
-
-    dq_report_path = args.dq_report_path or f"{args.silver_path}_dq_reports/{args.run_id}.json"
-    quarantine_path = args.quarantine_path or f"{args.silver_path}_quarantine/{args.run_id}"
-
-    bronze_df = spark.read.format("delta").load(args.bronze_path)
-
-    deduped, preclean_invalid, duplicate_rejects = normalize_and_dedupe_orders(
-        bronze_df,
-        allowed_statuses,
+    logger = get_pipeline_logger("pipeline.orders_bronze_to_silver")
+    log_pipeline_event(
+        logger,
+        "started",
+        run_id=args.run_id,
+        bronze_path=args.bronze_path,
+        silver_path=args.silver_path,
+        contract=args.contract,
+        expectations=args.expectations,
     )
 
-    _write_quarantine(preclean_invalid, f"{quarantine_path}/preclean_invalid")
-    _write_quarantine(duplicate_rejects, f"{quarantine_path}/duplicate_rejects")
+    try:
+        spark = get_spark("orders_bronze_to_silver")
+        contract = _load_contract(args.contract)
+        schema_version = hash_contract_json(args.contract)
+        allowed_statuses = contract["allowed_values"]["order_status"]
 
-    silver_out = (
-        deduped.select(
-            "order_id",
-            "customer_id",
-            "order_purchase_ts",
-            "order_status",
-            "_bronze_run_id",
-            "_bronze_ingest_ts",
-            "_bronze_source_file",
-            "_bronze_source_fingerprint",
-            "_bronze_schema_hash",
-        )
-        .withColumn("_schema_version", F.lit(schema_version))
-        .withColumn("_silver_run_id", F.lit(args.run_id))
-        .withColumn("_silver_ts", F.current_timestamp())
-    )
+        dq_report_path = args.dq_report_path or f"{args.silver_path}_dq_reports/{args.run_id}.json"
+        quarantine_path = args.quarantine_path or f"{args.silver_path}_quarantine/{args.run_id}"
 
-    dq_result = run_dq(silver_out, args.expectations)
-    write_dq_report(dq_result, dq_report_path)
-    write_failed_rows(dq_result, f"{quarantine_path}/dq_failed")
+        bronze_df = spark.read.format("delta").load(args.bronze_path)
 
-    if not dq_result.passed:
-        raise RuntimeError(
-            f"Silver DQ gate failed. See report at {dq_report_path}. Metrics={dq_result.metrics}"
+        deduped, preclean_invalid, duplicate_rejects = normalize_and_dedupe_orders(
+            bronze_df,
+            allowed_statuses,
         )
 
-    if _delta_exists(spark, args.silver_path):
-        target = DeltaTable.forPath(spark, args.silver_path)
-        (
-            target.alias("t")
-            .merge(silver_out.alias("s"), "t.order_id = s.order_id")
-            .whenMatchedUpdateAll()
-            .whenNotMatchedInsertAll()
-            .execute()
-        )
-    else:
-        silver_out.write.format("delta").mode("overwrite").save(args.silver_path)
+        preclean_invalid_count = preclean_invalid.count()
+        duplicate_rejects_count = duplicate_rejects.count()
 
+        _write_quarantine(preclean_invalid, f"{quarantine_path}/preclean_invalid")
+        _write_quarantine(duplicate_rejects, f"{quarantine_path}/duplicate_rejects")
+
+        silver_out = (
+            deduped.select(
+                "order_id",
+                "customer_id",
+                "order_purchase_ts",
+                "order_status",
+                "_bronze_run_id",
+                "_bronze_ingest_ts",
+                "_bronze_source_file",
+                "_bronze_source_fingerprint",
+                "_bronze_schema_hash",
+            )
+            .withColumn("_schema_version", F.lit(schema_version))
+            .withColumn("_silver_run_id", F.lit(args.run_id))
+            .withColumn("_silver_ts", F.current_timestamp())
+        )
+
+        silver_row_count = silver_out.count()
+
+        dq_result = run_dq(silver_out, args.expectations)
+        write_dq_report(dq_result, dq_report_path)
+        write_failed_rows(dq_result, f"{quarantine_path}/dq_failed")
+
+        if not dq_result.passed:
+            log_pipeline_event(
+                logger,
+                "failed",
+                run_id=args.run_id,
+                silver_path=args.silver_path,
+                dq_report_path=dq_report_path,
+                preclean_invalid_count=preclean_invalid_count,
+                duplicate_rejects_count=duplicate_rejects_count,
+                silver_row_count=silver_row_count,
+                error="Silver DQ gate failed",
+            )
+            raise RuntimeError(
+                f"Silver DQ gate failed. See report at {dq_report_path}. Metrics={dq_result.metrics}"
+            )
+
+        if _delta_exists(spark, args.silver_path):
+            target = DeltaTable.forPath(spark, args.silver_path)
+            (
+                target.alias("t")
+                .merge(silver_out.alias("s"), "t.order_id = s.order_id")
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
+            publish_mode = "merge"
+        else:
+            silver_out.write.format("delta").mode("overwrite").save(args.silver_path)
+            publish_mode = "initial_overwrite"
+
+        log_pipeline_event(
+            logger,
+            "completed",
+            run_id=args.run_id,
+            silver_path=args.silver_path,
+            dq_report_path=dq_report_path,
+            quarantine_path=quarantine_path,
+            schema_version=schema_version,
+            silver_row_count=silver_row_count,
+            preclean_invalid_count=preclean_invalid_count,
+            duplicate_rejects_count=duplicate_rejects_count,
+            publish_mode=publish_mode,
+        )
+
+    except Exception as exc:
+        log_pipeline_event(
+            logger,
+            "failed",
+            run_id=args.run_id,
+            bronze_path=args.bronze_path,
+            silver_path=args.silver_path,
+            error=str(exc),
+        )
+        raise
 
 if __name__ == "__main__":
     main()

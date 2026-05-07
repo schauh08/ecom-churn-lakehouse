@@ -12,6 +12,8 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from src.common.spark import get_spark
+from src.common.pipeline_logging import get_pipeline_logger, log_pipeline_event
+
 
 
 INVALID_LABEL_STATUSES = {"canceled", "unavailable"}
@@ -124,106 +126,152 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    spark = get_spark("labels")
-    as_of_date_py = date.fromisoformat(args.as_of_date)
-    label_version = _label_policy_version(args.label_horizon_days)
-
-    silver = (
-        spark.read.format("delta").load(args.silver_path)
-        .select("customer_id", "order_id", "order_purchase_ts", "order_status")
-        .withColumn("order_date", F.to_date("order_purchase_ts"))
-    )
-
-    dataset_end_date = silver.select(F.max("order_date").alias("dataset_end_date")).collect()[0]["dataset_end_date"]
-    if dataset_end_date is None:
-        raise RuntimeError("Silver orders table is empty; cannot generate labels.")
-
-    if as_of_date_py + timedelta(days=args.label_horizon_days) > dataset_end_date:
-        raise RuntimeError(
-            "Requested as_of_date is not training-eligible because the full future label window "
-            f"is not observable. as_of_date={args.as_of_date}, "
-            f"label_horizon_days={args.label_horizon_days}, dataset_end_date={dataset_end_date}"
-        )
-
-    as_of_date_col = F.to_date(F.lit(args.as_of_date))
-    label_window_end = F.date_add(as_of_date_col, args.label_horizon_days)
-
-    eligible_customers = (
-        silver.filter(F.col("order_date") <= as_of_date_col)
-        .select("customer_id")
-        .distinct()
-    )
-
-    valid_future_orders = (
-        silver.filter(
-            (F.col("order_date") > as_of_date_col)
-            & (F.col("order_date") <= label_window_end)
-            & (~F.col("order_status").isin(sorted(INVALID_LABEL_STATUSES)))
-        )
-        .select(F.col("customer_id").alias("future_customer_id"))
-        .distinct()
-    )
-
-    labels = (
-        eligible_customers.join(
-            valid_future_orders,
-            eligible_customers["customer_id"] == valid_future_orders["future_customer_id"],
-            how="left",
-        )
-        .withColumn(
-            "churn_label",
-            F.when(F.col("future_customer_id").isNull(), F.lit(1)).otherwise(F.lit(0)),
-        )
-        .drop("future_customer_id")
-        .withColumn("as_of_date", as_of_date_col)
-        .withColumn("_label_horizon_days", F.lit(args.label_horizon_days))
-        .withColumn("_label_version", F.lit(label_version))
-        .withColumn("_labels_run_id", F.lit(args.run_id))
-        .withColumn("_labels_ts", F.current_timestamp())
-        .select(
-            "customer_id",
-            "as_of_date",
-            "churn_label",
-            "_label_horizon_days",
-            "_label_version",
-            "_labels_run_id",
-            "_labels_ts",
-        )
-    )
-
-    quality_metrics = _assert_label_quality(labels)
-    row_count = labels.count()
-    positives = labels.filter(F.col("churn_label") == 1).count()
-    negatives = labels.filter(F.col("churn_label") == 0).count()
-
-    _write_metadata(
-        args.metadata_path,
-        as_of_date=args.as_of_date,
-        dataset_end_date=str(dataset_end_date),
-        label_horizon_days=args.label_horizon_days,
-        label_version=label_version,
+    logger = get_pipeline_logger("pipeline.labels")
+    log_pipeline_event(
+        logger,
+        "started",
         run_id=args.run_id,
-        row_count=row_count,
-        positives=positives,
-        negatives=negatives,
-        quality_metrics=quality_metrics,
+        silver_path=args.silver_path,
+        labels_path=args.labels_path,
+        as_of_date=args.as_of_date,
+        label_horizon_days=args.label_horizon_days,
     )
 
-    if _delta_exists(spark, args.labels_path):
-        target = DeltaTable.forPath(spark, args.labels_path)
-        (
-            target.alias("t")
-            .merge(
-                labels.alias("s"),
-                "t.customer_id = s.customer_id AND t.as_of_date = s.as_of_date",
-            )
-            .whenMatchedUpdateAll()
-            .whenNotMatchedInsertAll()
-            .execute()
-        )
-    else:
-        labels.write.format("delta").mode("overwrite").save(args.labels_path)
+    try:
+        spark = get_spark("labels")
+        as_of_date_py = date.fromisoformat(args.as_of_date)
+        label_version = _label_policy_version(args.label_horizon_days)
 
+        silver = (
+            spark.read.format("delta").load(args.silver_path)
+            .select("customer_id", "order_id", "order_purchase_ts", "order_status")
+            .withColumn("order_date", F.to_date("order_purchase_ts"))
+        )
+
+        dataset_end_date = silver.select(
+            F.max("order_date").alias("dataset_end_date")
+        ).collect()[0]["dataset_end_date"]
+
+        if dataset_end_date is None:
+            raise RuntimeError("Silver orders table is empty; cannot generate labels.")
+
+        if as_of_date_py + timedelta(days=args.label_horizon_days) > dataset_end_date:
+            raise RuntimeError(
+                "Requested as_of_date is not training-eligible because the full future label window "
+                f"is not observable. as_of_date={args.as_of_date}, "
+                f"label_horizon_days={args.label_horizon_days}, dataset_end_date={dataset_end_date}"
+            )
+
+        as_of_date_col = F.to_date(F.lit(args.as_of_date))
+        label_window_end = F.date_add(as_of_date_col, args.label_horizon_days)
+
+        eligible_customers = (
+            silver.filter(F.col("order_date") <= as_of_date_col)
+            .select("customer_id")
+            .distinct()
+        )
+
+        valid_future_orders = (
+            silver.filter(
+                (F.col("order_date") > as_of_date_col)
+                & (F.col("order_date") <= label_window_end)
+                & (~F.col("order_status").isin(sorted(INVALID_LABEL_STATUSES)))
+            )
+            .select(F.col("customer_id").alias("future_customer_id"))
+            .distinct()
+        )
+
+        labels = (
+            eligible_customers.join(
+                valid_future_orders,
+                eligible_customers["customer_id"] == valid_future_orders["future_customer_id"],
+                how="left",
+            )
+            .withColumn(
+                "churn_label",
+                F.when(F.col("future_customer_id").isNull(), F.lit(1)).otherwise(F.lit(0)),
+            )
+            .drop("future_customer_id")
+            .withColumn("as_of_date", as_of_date_col)
+            .withColumn("_label_horizon_days", F.lit(args.label_horizon_days))
+            .withColumn("_label_version", F.lit(label_version))
+            .withColumn("_labels_run_id", F.lit(args.run_id))
+            .withColumn("_labels_ts", F.current_timestamp())
+            .select(
+                "customer_id",
+                "as_of_date",
+                "churn_label",
+                "_label_horizon_days",
+                "_label_version",
+                "_labels_run_id",
+                "_labels_ts",
+            )
+        )
+
+        quality_metrics = _assert_label_quality(labels)
+        row_count = labels.count()
+        positives = labels.filter(F.col("churn_label") == 1).count()
+        negatives = labels.filter(F.col("churn_label") == 0).count()
+
+        _write_metadata(
+            args.metadata_path,
+            as_of_date=args.as_of_date,
+            dataset_end_date=str(dataset_end_date),
+            label_horizon_days=args.label_horizon_days,
+            label_version=label_version,
+            run_id=args.run_id,
+            row_count=row_count,
+            positives=positives,
+            negatives=negatives,
+            quality_metrics=quality_metrics,
+        )
+
+        if _delta_exists(spark, args.labels_path):
+            target = DeltaTable.forPath(spark, args.labels_path)
+            (
+                target.alias("t")
+                .merge(
+                    labels.alias("s"),
+                    "t.customer_id = s.customer_id AND t.as_of_date = s.as_of_date",
+                )
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
+            publish_mode = "merge"
+        else:
+            labels.write.format("delta").mode("overwrite").save(args.labels_path)
+            publish_mode = "initial_overwrite"
+
+        log_pipeline_event(
+            logger,
+            "completed",
+            run_id=args.run_id,
+            labels_path=args.labels_path,
+            as_of_date=args.as_of_date,
+            dataset_end_date=str(dataset_end_date),
+            label_horizon_days=args.label_horizon_days,
+            label_version=label_version,
+            row_count=row_count,
+            positives=positives,
+            negatives=negatives,
+            quality_metrics=quality_metrics,
+            publish_mode=publish_mode,
+            metadata_path=args.metadata_path,
+        )
+
+    except Exception as exc:
+        log_pipeline_event(
+            logger,
+            "failed",
+            run_id=args.run_id,
+            silver_path=args.silver_path,
+            labels_path=args.labels_path,
+            as_of_date=args.as_of_date,
+            label_horizon_days=args.label_horizon_days,
+            error=str(exc),
+        )
+        raise
 
 if __name__ == "__main__":
     main()

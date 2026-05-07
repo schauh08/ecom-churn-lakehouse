@@ -11,6 +11,8 @@ from pyspark.sql import functions as F
 
 from src.common.spark import get_spark
 from src.common.versioning import hash_contract_json
+from src.common.pipeline_logging import get_pipeline_logger, log_pipeline_event
+
 
 
 def _build_snapshot_id(as_of_date: str, feature_version: str) -> str:
@@ -224,49 +226,88 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    spark = get_spark("customer_features_daily")
-
-    feature_version = hash_contract_json(args.contract)
-    snapshot_id = _build_snapshot_id(args.as_of_date, feature_version)
-
-    silver_orders = spark.read.format("delta").load(args.silver_path)
-
-    features = build_feature_snapshot(
-        silver_orders,
-        as_of_date=args.as_of_date,
-        snapshot_id=snapshot_id,
-        feature_version=feature_version,
+    logger = get_pipeline_logger("pipeline.customer_features_daily")
+    log_pipeline_event(
+        logger,
+        "started",
         run_id=args.run_id,
+        silver_path=args.silver_path,
+        gold_path=args.gold_path,
+        as_of_date=args.as_of_date,
+        contract=args.contract,
     )
 
-    quality_metrics = _assert_gold_quality(features)
-    row_count = features.count()
+    try:
+        spark = get_spark("customer_features_daily")
 
-    _write_snapshot_metadata(
-        args.snapshot_metadata_path,
-        snapshot_id=snapshot_id,
-        as_of_date=args.as_of_date,
-        feature_version=feature_version,
-        run_id=args.run_id,
-        row_count=row_count,
-        quality_metrics=quality_metrics,
-    )
+        feature_version = hash_contract_json(args.contract)
+        snapshot_id = _build_snapshot_id(args.as_of_date, feature_version)
 
-    if _delta_exists(spark, args.gold_path):
-        target = DeltaTable.forPath(spark, args.gold_path)
-        (
-            target.alias("t")
-            .merge(
-                features.alias("s"),
-                "t.customer_id = s.customer_id AND t.as_of_date = s.as_of_date",
-            )
-            .whenMatchedUpdateAll()
-            .whenNotMatchedInsertAll()
-            .execute()
+        silver_orders = spark.read.format("delta").load(args.silver_path)
+
+        features = build_feature_snapshot(
+            silver_orders,
+            as_of_date=args.as_of_date,
+            snapshot_id=snapshot_id,
+            feature_version=feature_version,
+            run_id=args.run_id,
         )
-    else:
-        features.write.format("delta").mode("overwrite").save(args.gold_path)
 
+        quality_metrics = _assert_gold_quality(features)
+        row_count = features.count()
+
+        _write_snapshot_metadata(
+            args.snapshot_metadata_path,
+            snapshot_id=snapshot_id,
+            as_of_date=args.as_of_date,
+            feature_version=feature_version,
+            run_id=args.run_id,
+            row_count=row_count,
+            quality_metrics=quality_metrics,
+        )
+
+        if _delta_exists(spark, args.gold_path):
+            target = DeltaTable.forPath(spark, args.gold_path)
+            (
+                target.alias("t")
+                .merge(
+                    features.alias("s"),
+                    "t.customer_id = s.customer_id AND t.as_of_date = s.as_of_date",
+                )
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
+            publish_mode = "merge"
+        else:
+            features.write.format("delta").mode("overwrite").save(args.gold_path)
+            publish_mode = "initial_overwrite"
+
+        log_pipeline_event(
+            logger,
+            "completed",
+            run_id=args.run_id,
+            gold_path=args.gold_path,
+            as_of_date=args.as_of_date,
+            snapshot_id=snapshot_id,
+            feature_version=feature_version,
+            row_count=row_count,
+            publish_mode=publish_mode,
+            quality_metrics=quality_metrics,
+            snapshot_metadata_path=args.snapshot_metadata_path,
+        )
+
+    except Exception as exc:
+        log_pipeline_event(
+            logger,
+            "failed",
+            run_id=args.run_id,
+            silver_path=args.silver_path,
+            gold_path=args.gold_path,
+            as_of_date=args.as_of_date,
+            error=str(exc),
+        )
+        raise
 
 if __name__ == "__main__":
     main()

@@ -1,15 +1,13 @@
 from __future__ import annotations
-
 import argparse
 import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
-
 from src.common.spark import get_spark
+from src.common.pipeline_logging import get_pipeline_logger, log_pipeline_event
 
 
 BRONZE_SOURCE_SCHEMA: list[tuple[str, str]] = [
@@ -200,85 +198,130 @@ def main() -> None:
     parser.add_argument("--dataset", default="orders")
     args = parser.parse_args()
 
-    audit_path = args.audit_path or f"{args.bronze_path}_audit"
-    ingest_ts = datetime.now(timezone.utc).replace(tzinfo=None)
-
-    spark = get_spark("orders_to_bronze")
-
-    # 1) Read raw parquet exactly as-is.
-    raw_df = spark.read.parquet(args.input)
-
-    input_files = sorted(raw_df.inputFiles())
-    if not input_files:
-        raise ValueError(f"No input files found under: {args.input}")
-
-    # 2) Compute lineage + validate raw schema against the Bronze contract.
-    source_fingerprint = _build_source_fingerprint(input_files)
-    _validate_raw_schema(raw_df)
-    schema_hash = _hash_contract_schema()
-
-    # 3) Idempotency: do not ingest the exact same batch twice.
-    if _already_ingested(
-        spark,
-        audit_path,
+    logger = get_pipeline_logger("pipeline.orders_to_bronze")
+    log_pipeline_event(
+        logger,
+        "started",
+        run_id=args.run_id,
         dataset=args.dataset,
-        source_fingerprint=source_fingerprint,
-    ):
+        input_path=args.input,
+        bronze_path=args.bronze_path,
+    )
+
+    try:
+        audit_path = args.audit_path or f"{args.bronze_path}_audit"
+        ingest_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        spark = get_spark("orders_to_bronze")
+
+        # 1) Read raw parquet exactly as-is.
+        raw_df = spark.read.parquet(args.input)
+
+        input_files = sorted(raw_df.inputFiles())
+        if not input_files:
+            raise ValueError(f"No input files found under: {args.input}")
+
+        # 2) Compute lineage + validate raw schema against the Bronze contract.
+        source_fingerprint = _build_source_fingerprint(input_files)
+        _validate_raw_schema(raw_df)
+        schema_hash = _hash_contract_schema()
+
+        # 3) Idempotency: do not ingest the exact same batch twice.
+        if _already_ingested(
+            spark,
+            audit_path,
+            dataset=args.dataset,
+            source_fingerprint=source_fingerprint,
+        ):
+            _write_audit_record(
+                spark,
+                audit_path,
+                dataset=args.dataset,
+                run_id=args.run_id,
+                status="skipped_already_ingested",
+                source_fingerprint=source_fingerprint,
+                source_path=args.input,
+                source_file_count=len(input_files),
+                row_count=0,
+                schema_hash=schema_hash,
+                ingest_ts=ingest_ts,
+                bronze_path=args.bronze_path,
+                message="Input fingerprint already exists in Bronze audit log.",
+            )
+
+            log_pipeline_event(
+                logger,
+                "skipped",
+                run_id=args.run_id,
+                dataset=args.dataset,
+                source_fingerprint=source_fingerprint,
+                source_file_count=len(input_files),
+                reason="already_ingested",
+            )
+            return
+
+        row_count = raw_df.count()
+
+        # 4) Stamp row-level Bronze metadata.
+        out_df = (
+            raw_df.withColumn("run_id", F.lit(args.run_id))
+            .withColumn("ingest_ts", F.lit(ingest_ts).cast("timestamp"))
+            .withColumn("ingest_date", F.to_date(F.col("ingest_ts")))
+            .withColumn("source_file", F.input_file_name())
+            .withColumn("source_fingerprint", F.lit(source_fingerprint))
+            .withColumn("row_count", F.lit(row_count).cast("long"))
+            .withColumn("schema_hash", F.lit(schema_hash))
+        )
+
+        # 5) Append-only Bronze write, partitioned by ingest date.
+        (
+            out_df.write.format("delta")
+            .mode("append")
+            .partitionBy("ingest_date")
+            .save(args.bronze_path)
+        )
+
+        # 6) Write one success audit record for the batch.
         _write_audit_record(
             spark,
             audit_path,
             dataset=args.dataset,
             run_id=args.run_id,
-            status="skipped_already_ingested",
+            status="success",
             source_fingerprint=source_fingerprint,
             source_path=args.input,
             source_file_count=len(input_files),
-            row_count=0,
+            row_count=row_count,
             schema_hash=schema_hash,
             ingest_ts=ingest_ts,
             bronze_path=args.bronze_path,
-            message="Input fingerprint already exists in Bronze audit log.",
+            message=None,
         )
-        return
 
-    row_count = raw_df.count()
+        log_pipeline_event(
+            logger,
+            "completed",
+            run_id=args.run_id,
+            dataset=args.dataset,
+            row_count=row_count,
+            source_file_count=len(input_files),
+            source_fingerprint=source_fingerprint,
+            schema_hash=schema_hash,
+            bronze_path=args.bronze_path,
+            audit_path=audit_path,
+        )
 
-    # 4) Stamp row-level Bronze metadata.
-    out_df = (
-        raw_df.withColumn("run_id", F.lit(args.run_id))
-        .withColumn("ingest_ts", F.lit(ingest_ts).cast("timestamp"))
-        .withColumn("ingest_date", F.to_date(F.col("ingest_ts")))
-        .withColumn("source_file", F.input_file_name())
-        .withColumn("source_fingerprint", F.lit(source_fingerprint))
-        .withColumn("row_count", F.lit(row_count).cast("long"))
-        .withColumn("schema_hash", F.lit(schema_hash))
-    )
-
-    # 5) Append-only Bronze write, partitioned by ingest date.
-    (
-        out_df.write.format("delta")
-        .mode("append")
-        .partitionBy("ingest_date")
-        .save(args.bronze_path)
-    )
-
-    # 6) Write one success audit record for the batch.
-    _write_audit_record(
-        spark,
-        audit_path,
-        dataset=args.dataset,
-        run_id=args.run_id,
-        status="success",
-        source_fingerprint=source_fingerprint,
-        source_path=args.input,
-        source_file_count=len(input_files),
-        row_count=row_count,
-        schema_hash=schema_hash,
-        ingest_ts=ingest_ts,
-        bronze_path=args.bronze_path,
-        message=None,
-    )
-
+    except Exception as exc:
+        log_pipeline_event(
+            logger,
+            "failed",
+            run_id=args.run_id,
+            dataset=args.dataset,
+            input_path=args.input,
+            bronze_path=args.bronze_path,
+            error=str(exc),
+        )
+        raise
 
 if __name__ == "__main__":
     main()
