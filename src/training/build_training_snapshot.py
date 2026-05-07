@@ -11,6 +11,7 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from src.common.spark import get_spark
+from src.common.pipeline_logging import get_pipeline_logger, log_pipeline_event
 
 
 def _canonical_json(obj: Any) -> bytes:
@@ -124,80 +125,42 @@ def main() -> None:
     parser.add_argument("--as_of_end_date", default=None)
     args = parser.parse_args()
 
-    spark = get_spark("build_training_snapshot")
+    logger = get_pipeline_logger("pipeline.build_training_snapshot")
+    log_pipeline_event(
+        logger,
+        "started",
+        run_id=args.run_id,
+        gold_path=args.gold_path,
+        labels_path=args.labels_path,
+        training_snapshot_path=args.training_snapshot_path,
+        as_of_start_date=args.as_of_start_date,
+        as_of_end_date=args.as_of_end_date,
+    )
 
-    gold = spark.read.format("delta").load(args.gold_path)
-    labels = spark.read.format("delta").load(args.labels_path)
+    try:
+        spark = get_spark("build_training_snapshot")
 
-    if args.as_of_start_date:
-        gold = gold.filter(F.col("as_of_date") >= F.to_date(F.lit(args.as_of_start_date)))
-        labels = labels.filter(F.col("as_of_date") >= F.to_date(F.lit(args.as_of_start_date)))
+        gold = spark.read.format("delta").load(args.gold_path)
+        labels = spark.read.format("delta").load(args.labels_path)
 
-    if args.as_of_end_date:
-        gold = gold.filter(F.col("as_of_date") <= F.to_date(F.lit(args.as_of_end_date)))
-        labels = labels.filter(F.col("as_of_date") <= F.to_date(F.lit(args.as_of_end_date)))
+        if args.as_of_start_date:
+            gold = gold.filter(F.col("as_of_date") >= F.to_date(F.lit(args.as_of_start_date)))
+            labels = labels.filter(F.col("as_of_date") >= F.to_date(F.lit(args.as_of_start_date)))
 
-    joined = (
-        gold.alias("g")
-        .join(
-            labels.alias("l"),
-            on=["customer_id", "as_of_date"],
-            how="inner",
+        if args.as_of_end_date:
+            gold = gold.filter(F.col("as_of_date") <= F.to_date(F.lit(args.as_of_end_date)))
+            labels = labels.filter(F.col("as_of_date") <= F.to_date(F.lit(args.as_of_end_date)))
+
+        joined = (
+            gold.alias("g")
+            .join(
+                labels.alias("l"),
+                on=["customer_id", "as_of_date"],
+                how="inner",
+            )
         )
-    )
 
-    payload = joined.select(
-        "customer_id",
-        "as_of_date",
-        "recency_days",
-        "orders_30d",
-        "orders_90d",
-        "lifetime_orders",
-        "customer_tenure_days",
-        "avg_days_between_orders",
-        "churn_label",
-        F.col("g._snapshot_id").alias("_feature_snapshot_id"),
-        F.col("g._feature_version").alias("_feature_version"),
-        F.col("l._label_version").alias("_label_version"),
-        F.col("l._label_horizon_days").alias("_label_horizon_days"),
-    )
-
-    quality_metrics = _assert_training_snapshot_quality(payload)
-    row_count = payload.count()
-    if row_count == 0:
-        raise RuntimeError("Training snapshot assembly produced zero rows.")
-
-    feature_version = _single_distinct_value(payload, "_feature_version")
-    label_version = _single_distinct_value(payload, "_label_version")
-    label_horizon_days = _single_distinct_value(payload, "_label_horizon_days")
-
-    date_bounds = payload.agg(
-        F.min("as_of_date").alias("as_of_date_min"),
-        F.max("as_of_date").alias("as_of_date_max"),
-    ).collect()[0]
-
-    as_of_date_min = str(date_bounds["as_of_date_min"])
-    as_of_date_max = str(date_bounds["as_of_date_max"])
-
-    payload_schema_hash = _schema_hash(payload)
-
-    data_snapshot_id = _hash_obj(
-        {
-            "as_of_date_min": as_of_date_min,
-            "as_of_date_max": as_of_date_max,
-            "feature_version": feature_version,
-            "label_version": label_version,
-            "label_horizon_days": label_horizon_days,
-            "payload_schema_hash": payload_schema_hash,
-            "version": 1,
-        }
-    )
-
-    training_snapshot = (
-        payload.withColumn("_data_snapshot_id", F.lit(data_snapshot_id))
-        .withColumn("_training_run_id", F.lit(args.run_id))
-        .withColumn("_training_ts", F.current_timestamp())
-        .select(
+        payload = joined.select(
             "customer_id",
             "as_of_date",
             "recency_days",
@@ -207,45 +170,125 @@ def main() -> None:
             "customer_tenure_days",
             "avg_days_between_orders",
             "churn_label",
-            "_feature_snapshot_id",
-            "_feature_version",
-            "_label_version",
-            "_label_horizon_days",
-            "_data_snapshot_id",
-            "_training_run_id",
-            "_training_ts",
+            F.col("g._snapshot_id").alias("_feature_snapshot_id"),
+            F.col("g._feature_version").alias("_feature_version"),
+            F.col("l._label_version").alias("_label_version"),
+            F.col("l._label_horizon_days").alias("_label_horizon_days"),
         )
-    )
 
-    _write_metadata(
-        args.metadata_path,
-        data_snapshot_id=data_snapshot_id,
-        row_count=row_count,
-        as_of_date_min=as_of_date_min,
-        as_of_date_max=as_of_date_max,
-        feature_version=feature_version,
-        label_version=label_version,
-        payload_schema_hash=payload_schema_hash,
-        quality_metrics=quality_metrics,
-    )
+        quality_metrics = _assert_training_snapshot_quality(payload)
+        row_count = payload.count()
+        if row_count == 0:
+            raise RuntimeError("Training snapshot assembly produced zero rows.")
 
-    if _delta_exists(spark, args.training_snapshot_path):
-        target = DeltaTable.forPath(spark, args.training_snapshot_path)
-        (
-            target.alias("t")
-            .merge(
-                training_snapshot.alias("s"),
-                "t.customer_id = s.customer_id "
-                "AND t.as_of_date = s.as_of_date "
-                "AND t._data_snapshot_id = s._data_snapshot_id",
+        feature_version = _single_distinct_value(payload, "_feature_version")
+        label_version = _single_distinct_value(payload, "_label_version")
+        label_horizon_days = _single_distinct_value(payload, "_label_horizon_days")
+
+        date_bounds = payload.agg(
+            F.min("as_of_date").alias("as_of_date_min"),
+            F.max("as_of_date").alias("as_of_date_max"),
+        ).collect()[0]
+
+        as_of_date_min = str(date_bounds["as_of_date_min"])
+        as_of_date_max = str(date_bounds["as_of_date_max"])
+
+        payload_schema_hash = _schema_hash(payload)
+
+        data_snapshot_id = _hash_obj(
+            {
+                "as_of_date_min": as_of_date_min,
+                "as_of_date_max": as_of_date_max,
+                "feature_version": feature_version,
+                "label_version": label_version,
+                "label_horizon_days": label_horizon_days,
+                "payload_schema_hash": payload_schema_hash,
+                "version": 1,
+            }
+        )
+
+        training_snapshot = (
+            payload.withColumn("_data_snapshot_id", F.lit(data_snapshot_id))
+            .withColumn("_training_run_id", F.lit(args.run_id))
+            .withColumn("_training_ts", F.current_timestamp())
+            .select(
+                "customer_id",
+                "as_of_date",
+                "recency_days",
+                "orders_30d",
+                "orders_90d",
+                "lifetime_orders",
+                "customer_tenure_days",
+                "avg_days_between_orders",
+                "churn_label",
+                "_feature_snapshot_id",
+                "_feature_version",
+                "_label_version",
+                "_label_horizon_days",
+                "_data_snapshot_id",
+                "_training_run_id",
+                "_training_ts",
             )
-            .whenMatchedUpdateAll()
-            .whenNotMatchedInsertAll()
-            .execute()
         )
-    else:
-        training_snapshot.write.format("delta").mode("overwrite").save(args.training_snapshot_path)
 
+        _write_metadata(
+            args.metadata_path,
+            data_snapshot_id=data_snapshot_id,
+            row_count=row_count,
+            as_of_date_min=as_of_date_min,
+            as_of_date_max=as_of_date_max,
+            feature_version=feature_version,
+            label_version=label_version,
+            payload_schema_hash=payload_schema_hash,
+            quality_metrics=quality_metrics,
+        )
+
+        if _delta_exists(spark, args.training_snapshot_path):
+            target = DeltaTable.forPath(spark, args.training_snapshot_path)
+            (
+                target.alias("t")
+                .merge(
+                    training_snapshot.alias("s"),
+                    "t.customer_id = s.customer_id "
+                    "AND t.as_of_date = s.as_of_date "
+                    "AND t._data_snapshot_id = s._data_snapshot_id",
+                )
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
+            publish_mode = "merge"
+        else:
+            training_snapshot.write.format("delta").mode("overwrite").save(args.training_snapshot_path)
+            publish_mode = "initial_overwrite"
+
+        log_pipeline_event(
+            logger,
+            "completed",
+            run_id=args.run_id,
+            training_snapshot_path=args.training_snapshot_path,
+            data_snapshot_id=data_snapshot_id,
+            row_count=row_count,
+            as_of_date_min=as_of_date_min,
+            as_of_date_max=as_of_date_max,
+            feature_version=feature_version,
+            label_version=label_version,
+            payload_schema_hash=payload_schema_hash,
+            publish_mode=publish_mode,
+            metadata_path=args.metadata_path,
+        )
+
+    except Exception as exc:
+        log_pipeline_event(
+            logger,
+            "failed",
+            run_id=args.run_id,
+            gold_path=args.gold_path,
+            labels_path=args.labels_path,
+            training_snapshot_path=args.training_snapshot_path,
+            error=str(exc),
+        )
+        raise
 
 if __name__ == "__main__":
     main()
