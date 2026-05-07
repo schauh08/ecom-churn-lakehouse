@@ -1,21 +1,22 @@
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, Sequence, Tuple
-from fastapi.testclient import TestClient
-from services.api.app.main import app
 
 import json
 import os
-import shutil
 import subprocess
+import sys
 import uuid
+from pathlib import Path
+
+import pandas as pd
 import pytest
+from fastapi.testclient import TestClient
+
+from src.common.spark import get_spark
 
 
-def run_cmd(cmd: Sequence[str], *, cwd: Path, env: Dict[str, str], timeout_s: int = 900) -> None:
-    """Run a command and fail fast with full combined logs."""
+def run_cmd(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout_s: int = 1200) -> None:
     proc = subprocess.run(
-        list(cmd),
+        cmd,
         cwd=str(cwd),
         env=env,
         stdout=subprocess.PIPE,
@@ -27,73 +28,90 @@ def run_cmd(cmd: Sequence[str], *, cwd: Path, env: Dict[str, str], timeout_s: in
         raise AssertionError(f"Command failed: {' '.join(cmd)}\n\n{proc.stdout}")
 
 
-def assert_dir_nonempty(p: Path) -> None:
-    assert p.exists(), f"Missing path: {p}"
-    assert p.is_dir(), f"Expected a directory: {p}"
-    assert any(p.rglob("*")), f"Directory is empty: {p}"
+def write_sample_orders_parquet(path: Path) -> None:
+    rows = [
+        {
+            "order_id": "A1",
+            "customer_id": "CUST_0001",
+            "order_status": "delivered",
+            "order_purchase_timestamp": "2025-01-10 10:00:00",
+            "order_approved_at": None,
+            "order_delivered_carrier_date": None,
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": None,
+        },
+        {
+            "order_id": "B1",
+            "customer_id": "CUST_0002",
+            "order_status": "delivered",
+            "order_purchase_timestamp": "2025-01-20 12:00:00",
+            "order_approved_at": None,
+            "order_delivered_carrier_date": None,
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": None,
+        },
+        {
+            "order_id": "C1",
+            "customer_id": "CUST_0003",
+            "order_status": "delivered",
+            "order_purchase_timestamp": "2025-02-15 09:00:00",
+            "order_approved_at": None,
+            "order_delivered_carrier_date": None,
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": None,
+        },
+        {
+            "order_id": "A2",
+            "customer_id": "CUST_0001",
+            "order_status": "delivered",
+            "order_purchase_timestamp": "2025-03-10 11:00:00",
+            "order_approved_at": None,
+            "order_delivered_carrier_date": None,
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": None,
+        },
+        {
+            "order_id": "C2",
+            "customer_id": "CUST_0003",
+            "order_status": "delivered",
+            "order_purchase_timestamp": "2025-04-10 15:00:00",
+            "order_approved_at": None,
+            "order_delivered_carrier_date": None,
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": None,
+        },
+        {
+            "order_id": "A3",
+            "customer_id": "CUST_0001",
+            "order_status": "delivered",
+            "order_purchase_timestamp": "2025-05-10 08:30:00",
+            "order_approved_at": None,
+            "order_delivered_carrier_date": None,
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": None,
+        },
+        {
+            "order_id": "Z1",
+            "customer_id": "CUST_9999",
+            "order_status": "delivered",
+            "order_purchase_timestamp": "2025-06-15 00:00:00",
+            "order_approved_at": None,
+            "order_delivered_carrier_date": None,
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": None,
+        },
+    ]
 
-
-def read_table_columns(path: Path) -> Tuple[list[str], str]:
-    """
-    Reads schema columns from Gold table directory.
-    Supports Delta (if _delta_log exists) or Parquet directory.
-    Returns (columns, format_name).
-    """
-    # Prefer Spark because Delta might be used.
-    from pyspark.sql import SparkSession  # type: ignore
-
-    spark = (
-        SparkSession.builder.master("local[2]")
-        .appName("slice_e2e_test")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
-
-    try:
-        if (path / "_delta_log").exists():
-            df = spark.read.format("delta").load(str(path))
-            fmt = "delta"
-        else:
-            df = spark.read.parquet(str(path))
-            fmt = "parquet"
-        return df.columns, fmt
-    finally:
-        spark.stop()
-
-
-def read_distinct_feature_version(path: Path) -> str | None:
-    """Optional stronger check: feature_version stamped in Gold matches meta.json."""
-    from pyspark.sql import SparkSession  # type: ignore
-
-    spark = (
-        SparkSession.builder.master("local[2]")
-        .appName("slice_e2e_test_feature_version")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
-
-    try:
-        if (path / "_delta_log").exists():
-            df = spark.read.format("delta").load(str(path))
-        else:
-            df = spark.read.parquet(str(path))
-
-        if "_feature_version" not in df.columns:
-            return None
-
-        row = df.select("_feature_version").where(df["_feature_version"].isNotNull()).limit(1).collect()
-        return row[0]["_feature_version"] if row else None
-    finally:
-        spark.stop()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(path, index=False)
 
 
 @pytest.mark.e2e
-def test_slice_e2e(tmp_path: Path) -> None:
+def test_slice_e2e(tmp_path: Path, monkeypatch) -> None:
     repo_root = Path(__file__).resolve().parents[2]
-
+    python = sys.executable
     run_id = str(uuid.uuid4())
 
-    # --- sandbox paths (no writes to repo) ---
     sandbox = tmp_path / "sandbox"
     lakehouse_root = sandbox / "lakehouse"
     artifacts_root = sandbox / "artifacts"
@@ -101,35 +119,47 @@ def test_slice_e2e(tmp_path: Path) -> None:
     bronze_orders = lakehouse_root / "bronze" / "orders"
     silver_orders = lakehouse_root / "silver" / "orders"
     gold_features = lakehouse_root / "gold" / "customer_features_daily"
-    model_meta = artifacts_root / "model_meta.json"
+    gold_labels = lakehouse_root / "gold" / "customer_labels_daily"
+    training_snapshot = lakehouse_root / "training" / "customer_training_snapshot"
+    latest_features = artifacts_root / "serving" / "latest_features"
 
-    for d in (bronze_orders, silver_orders, gold_features, artifacts_root):
-        d.mkdir(parents=True, exist_ok=True)
+    model_path = artifacts_root / "models" / "ecomm_churn_baseline.pkl"
+    model_meta = artifacts_root / "models" / "model_meta.json"
+    eval_summary = artifacts_root / "models" / "evaluation_summary.md"
+    approved_model = artifacts_root / "models" / "approved_model_version.json"
+    feature_schema = artifacts_root / "models" / "feature_schema_info.json"
 
-    # --- sample input: copy your existing parquet into sandbox ---
-    sample_src = repo_root / "data" / "sample" / "orders.parquet"
-    assert sample_src.exists(), f"Sample input missing: {sample_src}"
-    sample_dst = sandbox / "orders.parquet"
-    shutil.copyfile(sample_src, sample_dst)
+    sample_parquet = sandbox / "orders.parquet"
+    write_sample_orders_parquet(sample_parquet)
 
-    # Keep env controlled. (You can add SPARK_* here if needed.)
     env = dict(os.environ)
+    env.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
+    env["PYSPARK_SUBMIT_ARGS"] = (
+        f"--conf spark.ui.enabled=false "
+        f"--conf spark.sql.shuffle.partitions=4 "
+        f"--conf spark.sql.warehouse.dir={sandbox / 'spark-warehouse'} "
+        "pyspark-shell"
+    )
 
-    # --- run the SAME commands as your Makefile ---
-    commands = [
-        (
-            "python",
+    run_cmd(
+        [
+            python,
             "-m",
             "src.ingestion.orders_to_bronze",
             "--input",
-            str(sample_dst),
+            str(sample_parquet),
             "--bronze_path",
             str(bronze_orders),
             "--run_id",
             run_id,
-        ),
-        (
-            "python",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+
+    run_cmd(
+        [
+            python,
             "-m",
             "src.transformations.orders_bronze_to_silver",
             "--bronze_path",
@@ -142,64 +172,166 @@ def test_slice_e2e(tmp_path: Path) -> None:
             str(repo_root / "data" / "expectations" / "silver" / "orders.yml"),
             "--run_id",
             run_id,
-        ),
-        (
-            "python",
-            "-m",
-            "src.features.customer_features_daily",
-            "--silver_path",
-            str(silver_orders),
-            "--gold_path",
-            str(gold_features),
-            "--contract",
-            str(repo_root / "data" / "contracts" / "gold" / "customer_features_daily.v1.json"),
-            "--as_of_date",
-            "2026-01-31",
-            "--run_id",
-            run_id,
-        ),
-        (
-            "python",
-            "-m",
-            "src.training.train_stub",
-            "--feature_contract",
-            str(repo_root / "data" / "contracts" / "gold" / "customer_features_daily.v1.json"),
-            "--out_model_meta",
-            str(model_meta),
-        ),
-    ]
+        ],
+        cwd=repo_root,
+        env=env,
+    )
 
-    for cmd in commands:
-        run_cmd(cmd, cwd=repo_root, env=env, timeout_s=900)
+    as_of_dates = ["2025-01-31", "2025-02-28", "2025-03-31"]
 
-    # --- assertions: lock the spine contract ---
-    assert_dir_nonempty(bronze_orders)
-    assert_dir_nonempty(silver_orders)
-    assert_dir_nonempty(gold_features)
-
-    cols, fmt = read_table_columns(gold_features)
-    required = {"customer_id", "as_of_date", "_feature_version"}
-    missing = required - set(cols)
-    assert not missing, f"Gold ({fmt}) missing columns {missing}. Found columns={cols}"
-
-    assert model_meta.exists(), f"Missing model meta: {model_meta}"
-    meta = json.loads(model_meta.read_text())
-
-    assert meta.get("model_version"), f"model_version missing/empty in {meta}"
-    assert meta.get("feature_version"), f"feature_version missing/empty in {meta}"
-
-    # Optional but strong: ensure Gold stamped version matches meta
-    fv_gold = read_distinct_feature_version(gold_features)
-    if fv_gold is not None:
-        assert fv_gold == meta["feature_version"], (
-            f"feature_version mismatch: gold={fv_gold} vs meta={meta['feature_version']}"
+    for as_of_date in as_of_dates:
+        run_cmd(
+            [
+                python,
+                "-m",
+                "src.features.customer_features_daily",
+                "--silver_path",
+                str(silver_orders),
+                "--gold_path",
+                str(gold_features),
+                "--contract",
+                str(repo_root / "data" / "contracts" / "gold" / "customer_features_daily.v1.json"),
+                "--as_of_date",
+                as_of_date,
+                "--run_id",
+                f"{run_id}-gold-{as_of_date}",
+            ],
+            cwd=repo_root,
+            env=env,
         )
 
-client = TestClient(app)
+        run_cmd(
+            [
+                python,
+                "-m",
+                "src.training.labels",
+                "--silver_path",
+                str(silver_orders),
+                "--labels_path",
+                str(gold_labels),
+                "--as_of_date",
+                as_of_date,
+                "--run_id",
+                f"{run_id}-labels-{as_of_date}",
+                "--metadata_path",
+                str(artifacts_root / "labels" / f"{as_of_date}.json"),
+            ],
+            cwd=repo_root,
+            env=env,
+        )
 
-r = client.post("/v1/churn/predict", json={"customer_id": "CUST_0001"})
-assert r.status_code == 200, r.text
-body = r.json()
+    run_cmd(
+        [
+            python,
+            "-m",
+            "src.training.build_training_snapshot",
+            "--gold_path",
+            str(gold_features),
+            "--labels_path",
+            str(gold_labels),
+            "--training_snapshot_path",
+            str(training_snapshot),
+            "--run_id",
+            f"{run_id}-snapshot",
+            "--metadata_path",
+            str(artifacts_root / "training" / "snapshot.json"),
+        ],
+        cwd=repo_root,
+        env=env,
+    )
 
-assert body.get("model_version")
-assert body.get("feature_version")
+    run_cmd(
+        [
+            python,
+            "-m",
+            "src.training.train_stub",
+            "--training_snapshot_path",
+            str(training_snapshot),
+            "--feature_contract",
+            str(repo_root / "data" / "contracts" / "gold" / "customer_features_daily.v1.json"),
+            "--out_model_path",
+            str(model_path),
+            "--out_model_meta",
+            str(model_meta),
+            "--evaluation_summary_path",
+            str(eval_summary),
+            "--approved_model_version_path",
+            str(approved_model),
+            "--feature_schema_info_path",
+            str(feature_schema),
+            "--model_name",
+            "ecomm-churn",
+            "--validation_fraction",
+            "0.34",
+            "--mlflow_tracking_uri",
+            f"file:{artifacts_root / 'mlruns'}",
+            "--mlflow_experiment",
+            "ecomm-churn-e2e",
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+
+    run_cmd(
+        [
+            python,
+            "-m",
+            "src.serving_features.build_latest_features",
+            "--gold_path",
+            str(gold_features),
+            "--latest_features_path",
+            str(latest_features),
+            "--run_id",
+            f"{run_id}-serving",
+            "--manifest_path",
+            str(artifacts_root / "serving" / "manifest.json"),
+        ],
+        cwd=repo_root,
+        env=env,
+    )
+
+    assert model_path.exists()
+    assert model_meta.exists()
+    assert approved_model.exists()
+    assert latest_features.exists()
+
+    meta = json.loads(model_meta.read_text(encoding="utf-8"))
+    assert meta["model_version"]
+    assert meta["feature_version"]
+
+    spark = get_spark("slice_e2e_assertions")
+    try:
+        gold_df = spark.read.format("delta").load(str(gold_features))
+        assert {"customer_id", "as_of_date", "_feature_version"}.issubset(set(gold_df.columns))
+    finally:
+        spark.stop()
+
+    monkeypatch.setenv("API_KEY", "test-api-key")
+    monkeypatch.setenv("MODEL_PATH", str(model_path))
+    monkeypatch.setenv("MODEL_META_PATH", str(model_meta))
+    monkeypatch.setenv("APPROVED_MODEL_VERSION_PATH", str(approved_model))
+    monkeypatch.setenv("LATEST_FEATURES_PATH", str(latest_features))
+
+    from services.api.app.routers.predict import get_feature_store, get_model_store
+
+    get_feature_store.cache_clear()
+    get_model_store.cache_clear()
+
+    from services.api.app.main import app
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/churn/predict",
+        headers={"X-API-Key": "test-api-key"},
+        json={"customer_id": "cust_0001"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["customer_id"] == "cust_0001"
+    assert 0.0 <= body["churn_probability"] <= 1.0
+    assert body["churn_label"] in [0, 1]
+    assert body["model_version"]
+    assert body["feature_version"]
+    assert body["request_id"]
