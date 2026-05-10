@@ -1,316 +1,264 @@
-# E-Commerce Churn Lakehouse V2 Architecture
 
-## 1. V2 scope
+## ARCHITECTURE.md
 
-This V2 build intentionally covers only the minimum thin slice required for a reliable,
-traceable churn prediction system:
+```md
+# Architecture
+
+## 1. Purpose
+
+This repository implements a lean churn-prediction thin slice for e-commerce orders. It is designed to prove the full path from raw data landing to trusted features, model training, MLflow lineage, and online inference.
+
+## 2. Thin-slice boundaries
+
+Included in scope:
 
 - one raw source domain: orders
 - one Bronze ingest path
-- one Silver trusted publish path with a blocking DQ gate
-- one Gold feature table
-- one real training pipeline
-- one real FastAPI prediction endpoint
-- CI, Docker, docs, runbook, and version traceability
+- one Silver trusted publish path with blocking DQ
+- one Gold customer feature table
+- one label-generation step
+- one training snapshot builder
+- one baseline logistic-regression training pipeline
+- one local/offline latest-features serving layer
+- one FastAPI prediction service
+- tests, CI, Docker, docs, runbook, and lineage metadata
 
-Out of scope for V2:
+Explicitly out of scope:
 
 - online feature store
-- canary or shadow deployments
-- rich drift tooling
+- canary or shadow rollout
+- advanced drift monitoring
 - multi-environment cloud deployment
-- full orchestrator rollout
+- full orchestration layer
 
----
+## 3. System overview
 
-## 2. Layer responsibilities
+```mermaid
+flowchart TB
+    subgraph Data
+      A[Orders parquet]
+      B[Bronze Delta]
+      C[Silver Delta]
+      D[Gold features Delta]
+      E[Labels Delta]
+      F[Training snapshot Delta]
+    end
 
-### Bronze
-Bronze preserves raw evidence from the source dataset with ingest metadata and replayability.
+    subgraph ML
+      G[Training pipeline]
+      H[MLflow]
+      I[Model artifact]
+      J[Approved model version]
+    end
 
-### Silver
-Silver is the trusted boundary. It contains normalized identifiers and timestamps, standardized
-status values, deterministic deduplication, cleaned malformed rows, and blocking data-quality checks.
+    subgraph Serving
+      K[Latest features parquet]
+      L[FastAPI]
+      M[Prediction response]
+    end
 
-### Gold
-Gold contains point-in-time-correct customer feature snapshots used for training and serving.
-Gold must never include data that would not have been available at the snapshot cutoff.
+    A --> B --> C --> D --> F --> G --> I --> L --> M
+    C --> E --> F
+    G --> H
+    D --> K --> L
+    J --> L
+```
 
----
+## 4. Medallion flow
 
-## 3. Dataset and domain assumptions
+Bronze
 
-V2 uses only the orders domain.
+Bronze preserves raw evidence and ingestion lineage.
 
-Primary business entities:
+Responsibilities:
 
-- `customer_id`
-- `order_id`
+read raw parquet as-is
+validate required raw source columns and types
+append-only Delta write
+add ingest metadata:
+run_id
+ingest_ts
+ingest_date
+source_file
+source_fingerprint
+row_count
+schema_hash
+record an audit table or artifact
+skip already-ingested input fingerprints
+Silver
 
-Primary event timestamp for feature timing:
+Silver is the trusted boundary.
 
-- `order_purchase_ts`
+Responsibilities:
 
-Trusted upstream source for Gold:
+normalize keys and timestamps
+standardize order_status
+deterministically deduplicate by order_id
+quarantine malformed and duplicate rejects
+enforce blocking DQ rules before publish
+publish with ACID-backed merge semantics
 
-- Silver orders table only
+Silver blocking checks:
 
-V2 does **not** assume access to historical status-change events. Because of that, Gold features
-must avoid any logic that depends on knowing when a status changed over time.
+order_id not null
+customer_id not null
+unique order_id
+allowed order_status
 
----
+Gold
 
-## 4. Gold grain and snapshot cadence
+Gold materializes point-in-time-safe customer feature snapshots.
 
-### Gold grain
-The Gold feature table has exactly one row per:
+Current Gold grain:
 
-- `customer_id`
-- `as_of_date`
+one row per customer_id, as_of_date
 
-### Snapshot cadence
-Snapshots are generated daily.
+Current features:
 
-This means the model is trained and served against daily customer snapshots rather than event-level rows.
+recency_days
+orders_30d
+orders_90d
+lifetime_orders
+customer_tenure_days
+avg_days_between_orders
 
----
+Gold also stamps:
 
-## 5. Exact point-in-time policy
+_snapshot_id
+_feature_version
+_gold_run_id
+_gold_ts
 
-## 5.1 Definition of `as_of_date`
+## 5. Point-in-time and leakage policy
+as_of_date
 
-`as_of_date` is the daily snapshot cutoff date for a Gold customer feature row.
+as_of_date is the snapshot cutoff date for a Gold feature row.
 
-For a Gold row keyed by `(customer_id, as_of_date)`:
+Historical records are eligible for Gold only when:
 
-- the snapshot represents everything known **through the end of `as_of_date`**
-- the snapshot must exclude all information that occurs **after `as_of_date`**
+to_date(order_purchase_ts) <= as_of_date
 
-Implementation rule for comparisons:
+Feature window policy
 
-- derive `event_date = to_date(order_purchase_ts)`
-- a record is historical for the snapshot only if `event_date <= as_of_date`
-
-This keeps the policy deterministic and avoids mixed date/timestamp boundary ambiguity.
-
----
-
-## 5.2 Data allowed before cutoff
-
-Gold features may only use data that satisfies **all** of the following:
-
-1. the row comes from the trusted Silver orders table
-2. the row belongs to the same `customer_id`
-3. `to_date(order_purchase_ts) <= as_of_date`
-4. the field is safe from future leakage under the V2 data model
-
-For V2, Gold feature logic may use:
-
-- `customer_id`
-- `order_id`
-- `order_purchase_ts`
-- date-derived trailing-window calculations built from `order_purchase_ts`
-
-Examples of allowed Gold features:
-
-- `recency_days`
-- `orders_30d`
-- `orders_90d`
-- `lifetime_orders`
-- `customer_tenure_days`
-- `avg_days_between_orders`
-
-For V2, Gold feature logic must **not** use:
-
-- future orders
-- future statuses
-- delivery timestamps
-- approval timestamps
-- carrier timestamps
-- customer-delivery timestamps
-- payment outcomes
-- any field whose final value may only be known after the snapshot cutoff
-
-Rationale:
-the V2 plan requires Gold to be point-in-time correct and leakage-safe, and V2 does not include
-status-history reconstruction. So Gold should be built only from purchase-time history, not from
-eventual downstream outcomes. :contentReference[oaicite:1]{index=1}
-
----
-
-## 5.3 Feature window rule
-
-A feature window is any historical time range used to compute Gold features.
-
-All feature windows must end at `as_of_date`, inclusive.
+All feature windows end at as_of_date, inclusive.
 
 Examples:
 
-- `orders_30d` uses rows where `event_date` is in `[as_of_date - 29 days, as_of_date]`
-- `orders_90d` uses rows where `event_date` is in `[as_of_date - 89 days, as_of_date]`
-- `lifetime_orders` uses rows where `event_date <= as_of_date`
-- `customer_tenure_days` uses the first observed historical order date through `as_of_date`
-- `avg_days_between_orders` uses only order dates on or before `as_of_date`
+orders_30d uses [as_of_date - 29 days, as_of_date]
+orders_90d uses [as_of_date - 89 days, as_of_date]
+lifetime_orders uses all orders on or before as_of_date
+Label window policy
 
-No feature window may include rows with `event_date > as_of_date`.
+The churn horizon is fixed at 60 days.
 
----
+Label window:
 
-## 6. Label-window policy
+(as_of_date, as_of_date + 60 days]
 
-## 6.1 Label definition
+Label definition:
 
-The churn horizon for V2 is fixed at **60 days**.
+churn_label = 1 if no valid future order appears in the next 60 days
+churn_label = 0 if at least one valid future order appears in that window
 
-For each `(customer_id, as_of_date)` snapshot:
+Invalid future-order statuses for label generation:
 
-- `churn_label = 1` if the customer places **no valid future order** in the next 60 days
-- `churn_label = 0` if the customer places **at least one valid future order** in the next 60 days
+canceled
+unavailable
+Training eligibility rule
 
-A valid future order is an order that:
+A snapshot is eligible for training only if the full label horizon is observable:
 
-- belongs to the same `customer_id`
-- has `to_date(order_purchase_ts)` in the future label window
-- has final status **not** in the invalid bucket
+as_of_date + 60 days <= dataset_end_date
 
-For V2, the invalid bucket is:
+Leakage prevention rules
 
-- `canceled`
-- `unavailable`
+Gold features must not use:
 
----
+future orders
+future statuses
+delivery outcomes
+payment outcomes
+any field that becomes known only after as_of_date
 
-## 6.2 Exact label window
+Feature generation and label generation are separate steps by design.
 
-The future label window is:
+## 6. Contracts, expectations, and trusted boundaries
+Bronze contract
 
-- `(as_of_date, as_of_date + 60 days]`
+Bronze stores raw shape plus ingestion metadata and a deterministic schema_hash for the source schema.
 
-Implementation rule:
+Silver contract and expectations
 
-- a row is eligible for label generation only if
-  `to_date(order_purchase_ts) > as_of_date`
-  and
-  `to_date(order_purchase_ts) <= date_add(as_of_date, 60)`
+Silver has both:
 
-This rule must be used only in label generation, never in Gold feature generation.
+a schema contract in data/contracts/silver/orders.v1.json
+expectations in data/expectations/silver/orders.yml
 
----
+This is the enforceable trust boundary in the repo.
 
-## 6.3 Training eligibility rule
+Gold contract
 
-A snapshot is eligible for training only if the full future label window is observable.
+Gold has a strict feature contract in data/contracts/gold/customer_features_daily.v1.json to reduce training-serving skew.
 
-Implementation rule:
+## 7. Versioning and lineage
 
-- exclude any snapshot where `date_add(as_of_date, 60) > dataset_end_date`
+Lineage is carried through the stack using explicit metadata.
 
-This prevents mislabeled training examples near the end of the dataset.
+Examples:
 
----
+Bronze: run_id, schema_hash, source_fingerprint
+Silver: _schema_version, _silver_run_id
+Gold: _snapshot_id, _feature_version, _gold_run_id
+Labels: _label_version, _labels_run_id
+Training snapshot: _data_snapshot_id, _training_run_id
+Model: model_version, approved_model_version, data_snapshot_id, feature/schema metadata
+API response: model_version, feature_version, request_id
 
-## 7. Separation of feature window and label window
+The training pipeline also records MLflow artifacts and run metadata so a model can be tied back to the exact feature snapshot and schema.
 
-Gold feature generation and label generation are separate steps.
+## 8. Training design
 
-### Feature step
-Uses only historical data:
+Baseline training pipeline characteristics:
 
-- `event_date <= as_of_date`
+logistic regression
+time-based split on as_of_date
+class weighting for imbalance
+metrics:
+PR-AUC
+ROC-AUC
+Brier score
+model artifact persisted locally
+model metadata persisted locally
+MLflow params, metrics, and artifacts logged
 
-### Label step
-Uses only future data:
+## 9. Serving design
 
-- `event_date > as_of_date`
-- `event_date <= date_add(as_of_date, 60)`
+Serving is intentionally local/offline-backed in this version.
 
-### Hard separation rule
-There must be no overlap between the feature window and the label window.
+Latest-features strategy
 
-That means:
+The serving layer reads a materialized parquet export of the latest Gold snapshot per customer. The API never recomputes features on request.
 
-- data used to compute Gold features cannot be reused from the future label window
-- data used to assign `churn_label` cannot appear in the Gold feature calculation for the same snapshot
-- the training dataset must be formed by joining an already-built Gold snapshot to an already-built label snapshot
+Inference flow
+authenticate request with API key
+load approved model bundle from local artifact path
+load latest features store from local parquet path
+retrieve features for customer_id
+score probability
+return prediction with model_version, feature_version, and request_id
 
-This separation is mandatory for point-in-time correctness.
+## 10. Reliability and observability
 
----
+Minimal production-minded controls in scope:
 
-## 8. Leakage-prevention rules
+pipeline run_id logging
+API request_id logging
+structured logs
+no raw customer id in API logs
+readiness and version endpoints
+basic counters and latency logging
+CI gating on lint, type check, unit/contract tests, and thin integration test
 
-The following rules are non-negotiable for V2:
+## 11. Deployment stance
 
-### Rule 1: no future timestamps in Gold
-If a row has `event_date > as_of_date`, it cannot be used in Gold features for that snapshot.
-
-### Rule 2: no future-derived outcomes in Gold
-Gold features cannot use fields that encode eventual post-purchase outcomes, including:
-
-- final delivery outcomes
-- final payment outcomes
-- future status results
-- any downstream timestamp that happens after purchase and may not have been known by `as_of_date`
-
-### Rule 3: no label fields inside Gold
-`churn_label`, future-order counts, and any future-retention indicators belong to label generation only.
-They must never be materialized as Gold features.
-
-### Rule 4: no overlap between feature windows and label windows
-Historical feature windows end at `as_of_date`.
-Future label windows begin strictly after `as_of_date`.
-
-### Rule 5: no ad hoc training queries
-Training must consume a versioned feature snapshot and a versioned label snapshot.
-Do not build training data from one-off queries that mix historical and future logic in the same step.
-
-### Rule 6: serving must mirror training semantics
-Online or batch scoring for a given `as_of_date` must use the same Gold feature logic used during training.
-Serving must not compute features using data beyond the intended cutoff.
-
----
-
-## 9. Operational definition of Gold correctness
-
-A Gold snapshot is considered correct only if all of the following are true:
-
-1. one row exists per `customer_id, as_of_date`
-2. every feature is computed only from data with `event_date <= as_of_date`
-3. no future-derived fields are used in feature computation
-4. the label window is computed separately using only future data
-5. snapshots without a fully observable 60-day future window are excluded from training
-6. the resulting snapshot can be reproduced for the same `as_of_date`
-
----
-
-## 10. Consequences for implementation
-
-The implementation in `src/features/customer_features_daily.py` must follow this contract exactly:
-
-- input: trusted Silver orders
-- grain: one row per `customer_id, as_of_date`
-- timing rule: historical rows only, through `as_of_date`
-- no use of future-derived order outcome fields as predictors
-- no label logic inside feature generation
-
-The implementation in label generation must follow this contract exactly:
-
-- input: trusted Silver orders
-- label horizon: 60 days
-- future window: `(as_of_date, as_of_date + 60 days]`
-- exclude snapshots beyond dataset coverage
-
----
-
-## 11. Summary
-
-V2 Gold is a daily, point-in-time-correct customer snapshot layer.
-
-The exact timing contract is:
-
-- features use only `event_date <= as_of_date`
-- labels use only `event_date > as_of_date` and `event_date <= as_of_date + 60 days`
-- feature logic and label logic must remain separate
-- no future data or future-derived outcomes may leak into Gold features
-
-This is the core policy that makes the Gold layer trustworthy for both training and serving.
+This repo supports local execution and API containerization. It is not yet a multi-environment deployment system. That is an intentional scope decision for the thin slice.
